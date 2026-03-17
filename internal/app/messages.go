@@ -6,3 +6,19 @@ import "time"
 type clockTickMsg time.Time
 
 type animTickMsg time.Time
+
+type nlReloadKind uint8
+
+const (
+	nlReloadInterfaces nlReloadKind = iota
+	nlReloadNeighAndFDB
+	nlReloadRoutes
+	nlReloadLinks
+)
+
+type nlReloadMask uint8
+
+type nlReloadTickMsg struct {
+	NamespaceID uint64
+	At          time.Time
+}

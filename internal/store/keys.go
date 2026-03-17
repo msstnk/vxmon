@@ -3,43 +3,54 @@ package store
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
-	"vxmon/internal/types"
+	"github.com/msstnk/vxmon/internal/types"
 )
 
 // keys.go generates stable record keys and fingerprints for reconcile().
-// neighKey is called from Store.ReloadNeighAndFDB via reconcile().
 func neighKey(n types.NeighEntry) string {
-	return fmt.Sprintf("%d|%s", n.InterfaceID, n.IP)
+	return strconv.FormatUint(n.NamespaceID, 10) + "|" + fmt.Sprintf("%d|%d|%d|%s", n.InterfaceID, n.VLANID, n.VxlanID, n.IP)
 }
 
-// neighFingerprint is called from Store.ReloadNeighAndFDB via reconcile().
 func neighFingerprint(n types.NeighEntry) string {
-	return fmt.Sprintf("%s|%d", n.HardwareAddr, n.State)
+	return fmt.Sprintf("%s|%d|%s|%d", n.MACAddr, n.State, n.InterfaceName, n.MasterID)
 }
 
-// fdbKey is called from Store.ReloadNeighAndFDB via reconcile().
 func fdbKey(f types.FdbEntry) string {
-	return fmt.Sprintf("%s|%d|%s|%d|%s", f.BridgeName, f.VLANId, f.MacAddr, f.VxlanId, f.RemoteVTEP)
+	return strconv.FormatUint(f.NamespaceID, 10) + "|" + fmt.Sprintf("%d|%d|%d|%s|%d|%s", f.BridgeID, f.PortID, f.VLANID, f.MACAddr, f.VxlanID, f.RemoteVTEP)
 }
 
-// fdbFingerprint is called from Store.ReloadNeighAndFDB via reconcile().
 func fdbFingerprint(f types.FdbEntry) string {
-	return fmt.Sprintf("%s|%s|%d|%s", f.PortName, f.RemoteVTEP, f.State, f.IPAddr)
+	return fmt.Sprintf("%s|%s|%d|%s", f.BridgeName, f.PortName, f.State, f.NamespaceName)
 }
 
-// routeKey is called from Store.ReloadRoutes via reconcile().
 func routeKey(r types.RouteEntry) string {
-	return fmt.Sprintf("%d|%s", r.Table, r.Dst)
+	return strconv.FormatUint(r.NamespaceID, 10) + "|" + fmt.Sprintf("%d|%s|%d|%d|%d|%d|%s", r.Table, r.Dst, r.Priority, r.Type, r.Protocol, r.Scope, r.Src)
 }
 
-// routeFingerprint is called from Store.ReloadRoutes via reconcile().
 func routeFingerprint(r types.RouteEntry) string {
 	nh := make([]string, 0, len(r.Nexthops))
 	for _, n := range r.Nexthops {
 		nh = append(nh, n.Gw+"@"+n.Dev)
 	}
 	sort.Strings(nh)
-	return fmt.Sprintf("%d|%d|%s", r.Type, r.Protocol, strings.Join(nh, ";"))
+	return strings.Join(nh, ";")
+}
+
+func processKey(p types.ProcessInfo) string {
+	return strconv.FormatUint(p.NamespaceID, 10) + "|" + strconv.Itoa(p.PID)
+}
+
+func processFingerprint(p types.ProcessInfo) string {
+	return p.Exe + "|" + p.User
+}
+
+func linkKey(l types.NamespaceLinkInfo) string {
+	return strconv.FormatUint(l.NamespaceID, 10) + "|" + strconv.Itoa(l.InterfaceID)
+}
+
+func linkFingerprint(l types.NamespaceLinkInfo) string {
+	return fmt.Sprintf("%s|%s|%d|%d", l.Name, l.Type, l.RxErrors, l.TxErrors)
 }

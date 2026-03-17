@@ -6,199 +6,239 @@ import (
 	"strings"
 
 	"net/netip"
-	"vxmon/internal/store"
-	"vxmon/internal/types"
-	"vxmon/internal/ui"
 
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/sys/unix"
+
+	"github.com/msstnk/vxmon/internal/helpers"
+	"github.com/msstnk/vxmon/internal/store"
+	"github.com/msstnk/vxmon/internal/types"
+	"github.com/msstnk/vxmon/internal/ui"
 )
 
-// bottom_view.go builds the bottom pane tables for FDB, Neigh, and Route modes.
-// ipFamilyOrderFromAddrStr is called by buildBottom when sorting neighbor rows.
-func ipFamilyOrderFromAddrStr(s string) int {
-	if strings.Contains(s, ":") {
-		return 1
-	}
-	return 0
+// bottom_view.go builds the bottom pane tables for FDB, Neigh, Route, Process, and Link modes.
+func errorRows(text string) []ui.ListRow {
+	style := lipgloss.NewStyle().Foreground(ui.ColorWarn).Bold(true)
+	return []ui.ListRow{{Text: text, Style: style}}
 }
 
-// isMulticastIPStr is called by buildBottom and vrfUsedIfSet.
-func isMulticastIPStr(s string) bool {
-	addr, err := netip.ParseAddr(strings.TrimSpace(s))
-	if err != nil {
-		return strings.HasPrefix(s, "ff") || strings.HasPrefix(s, "FF") || strings.HasPrefix(s, "224.")
-	}
-	return addr.IsMulticast()
+func renderTableRows(headers []string, tableRows [][]string, styles []lipgloss.Style, width int) (string, []ui.ListRow) {
+	return renderTableRowsWithSpecs(headers, tableRows, nil, styles, width)
 }
 
-// routeFamilyOrder is called by buildBottom when sorting route rows by address family.
-func routeFamilyOrder(dst string, gw string) int {
-	if strings.Contains(dst, ":") {
-		return 1
+func renderTableRowsWithSpecs(headers []string, tableRows [][]string, specs []ui.ColumnSpec, styles []lipgloss.Style, width int) (string, []ui.ListRow) {
+	var (
+		header string
+		lines  []string
+	)
+	if len(specs) == 0 {
+		header, lines = ui.FormatTable(headers, tableRows, width)
+	} else {
+		header, lines = ui.FormatTableWithSpecs(headers, tableRows, specs, width)
 	}
-	if strings.Contains(dst, ".") {
-		return 0
+	rows := make([]ui.ListRow, 0, len(lines))
+	for i, line := range lines {
+		rows = append(rows, ui.ListRow{Text: line, Style: styles[i]})
 	}
-	if strings.Contains(gw, ":") {
-		return 1
-	}
-	return 0
+	return header, rows
 }
 
-// buildBottom is called from refreshViewWithTopViewport to render the active bottom table.
-func (m Model) buildBottom() (header string, rows []ui.ListRow, cursorIdx int) {
-	base := lipgloss.NewStyle()
-	base = base.Foreground(lipgloss.Color(ui.ColorBaseColor))
-	now := unixNanoNow(m.fadeClock)
+func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cursorIdx int) {
+	base := lipgloss.NewStyle().Foreground(lipgloss.Color(ui.ColorBaseColor))
+	now := m.fadeClock.UnixNano()
 
 	switch {
 	case m.topMode == TopBridge && m.botMode == BottomFDB:
-		bridge := m.selectedBridge()
-		if bridge == "" {
+		bridge := pickBridge(data.bridges, m.bridgeCursor)
+		if bridge.Info.InterfaceName == "" {
 			return "", nil, 0
 		}
-		selectedPort, portFilterOn := m.selectedBridgeIfFilter()
+		selectedPort, portFilterOn := bridgeIfFilter(data.bridges, m.bridgeCursor, m.bridgeDevFilterIdx, m.topMode)
 
 		fdbs := m.st.FDBRecords(true)
-
+		liveFdbs := m.st.FDBRecords(false)
 		neighs := m.st.NeighRecords(false)
-		macToIP := make(map[string]string, len(neighs))
+		neighByMAC := make(map[string][]types.NeighEntry, len(neighs))
 		for _, n := range neighs {
-			if n.Val.HardwareAddr != "" && n.Val.IP != "" {
-				macToIP[n.Val.HardwareAddr] = n.Val.IP
+			if n.Val.NamespaceID != bridge.NamespaceID {
+				continue
+			}
+			if n.Val.MACAddr != "" && n.Val.IP != "" {
+				neighByMAC[n.Val.MACAddr] = append(neighByMAC[n.Val.MACAddr], n.Val)
 			}
 		}
 
-		bridgeFdb := make([]store.Record[types.FdbEntry], 0, len(fdbs))
+		allBridgeFdb := make([]store.Record[types.FdbEntry], 0, len(liveFdbs))
+		final := make([]store.Record[types.FdbEntry], 0, len(fdbs))
+		for _, r := range liveFdbs {
+			if r.Val.NamespaceID != bridge.NamespaceID || r.Val.BridgeName != bridge.Info.InterfaceName {
+				continue
+			}
+			allBridgeFdb = append(allBridgeFdb, r)
+		}
 		for _, r := range fdbs {
-			if r.Val.BridgeName == bridge {
-				if portFilterOn && r.Val.PortName != selectedPort {
-					continue
-				}
-				if !m.detailed && r.Val.VLANId == 0 && r.Val.VxlanId == 0 {
-					continue
-				}
-				bridgeFdb = append(bridgeFdb, r)
+			if r.Val.NamespaceID != bridge.NamespaceID || r.Val.BridgeName != bridge.Info.InterfaceName {
+				continue
 			}
+			if portFilterOn && r.Val.PortName != selectedPort {
+				continue
+			}
+			if !m.detailed && r.Val.VLANID == 0 && r.Val.VxlanID == 0 {
+				continue
+			}
+			final = append(final, r)
 		}
-		vniToVlan := map[int]int{}
-		for _, r := range bridgeFdb {
-			if r.Val.VLANId != 0 && r.Val.VxlanId != 0 {
-				vniToVlan[r.Val.VxlanId] = r.Val.VLANId
-			}
-		}
-		grouped := make(map[string][]store.Record[types.FdbEntry], len(bridgeFdb))
-		for _, r := range bridgeFdb {
-			f := r.Val
-			if f.VLANId == 0 && f.VxlanId != 0 {
-				if vlan, ok := vniToVlan[f.VxlanId]; ok {
-					f.VLANId = vlan
-				}
-			}
-			key := ""
-			if f.MacAddr == "00:00:00:00:00:00" {
-				key = fmt.Sprintf("%d-%s-%d-%s", f.VLANId, f.MacAddr, f.VxlanId, f.RemoteVTEP)
-			} else {
-				key = fmt.Sprintf("%d-%s-%d", f.VLANId, f.MacAddr, f.VxlanId)
-			}
 
-			r.Val = f
-			grouped[key] = append(grouped[key], r)
+		vniToVlans := make(map[int]map[int]struct{}, len(allBridgeFdb))
+		for _, r := range allBridgeFdb {
+			if r.Val.VLANID != 0 && r.Val.VxlanID != 0 {
+				if _, ok := vniToVlans[r.Val.VxlanID]; !ok {
+					vniToVlans[r.Val.VxlanID] = map[int]struct{}{}
+				}
+				vniToVlans[r.Val.VxlanID][r.Val.VLANID] = struct{}{}
+			}
 		}
-		final := make([]store.Record[types.FdbEntry], 0, len(grouped))
-		for _, grp := range grouped {
-			merged := grp[0]
-			for _, rr := range grp {
-				if merged.Val.RemoteVTEP == "" && rr.Val.RemoteVTEP != "" {
-					merged.Val.RemoteVTEP = rr.Val.RemoteVTEP
+
+		for i := range final {
+			if final[i].Val.VLANID == 0 && final[i].Val.VxlanID != 0 {
+				if vlans := vniToVlans[final[i].Val.VxlanID]; len(vlans) == 1 {
+					for vlan := range vlans {
+						final[i].Val.VLANID = vlan
+					}
 				}
 			}
-			final = append(final, merged)
 		}
 		sort.Slice(final, func(i, j int) bool {
-			// Sort by VLAN, MAC, Port, then Remote VTEP
-			if final[i].Val.VLANId != final[j].Val.VLANId {
-				return final[i].Val.VLANId < final[j].Val.VLANId
+			if final[i].Val.VLANID != final[j].Val.VLANID {
+				return final[i].Val.VLANID < final[j].Val.VLANID
 			}
-
-			if final[i].Val.MacAddr != final[j].Val.MacAddr {
-				if final[i].Val.MacAddr != final[j].Val.MacAddr {
-					// Entries with BUM addresses at the bottom of the list
-					if final[i].Val.MacAddr == "00:00:00:00:00:00" {
-						return false
-					}
-					if final[j].Val.MacAddr == "00:00:00:00:00:00" {
-						return true
-					}
-					return final[i].Val.MacAddr < final[j].Val.MacAddr
+			if final[i].Val.MACAddr != final[j].Val.MACAddr {
+				if final[i].Val.MACAddr == "00:00:00:00:00:00" {
+					return false
 				}
+				if final[j].Val.MACAddr == "00:00:00:00:00:00" {
+					return true
+				}
+				return final[i].Val.MACAddr < final[j].Val.MACAddr
 			}
-			if final[i].Val.PortName != final[j].Val.PortName {
-				return final[i].Val.PortName < final[j].Val.PortName
+			if final[i].Val.PortID != final[j].Val.PortID {
+				return final[i].Val.PortID < final[j].Val.PortID
 			}
 			return final[i].Val.RemoteVTEP < final[j].Val.RemoteVTEP
 		})
 
 		headers := []string{"VLAN", "MAC_ADDR", "NEIGH_IP", "PORT", "VNI", "REMOTE_VTEP"}
-		tableRows := make([][]string, 0, len(final))
-		styles := make([]lipgloss.Style, 0, len(final))
+		type fdbDisplayRow struct {
+			rec     store.Record[types.FdbEntry]
+			neighIP string
+			vni     string
+		}
+		displayRows := make([]fdbDisplayRow, 0, len(final))
+		remotePresent := make(map[string]struct{}, len(final))
 		for _, r := range final {
-			neighIP := macToIP[r.Val.MacAddr]
-			vxlan_vni := ""
-			if r.Val.VxlanId != 0 {
-				vxlan_vni = fmt.Sprintf("%d", r.Val.VxlanId)
+			vni := ""
+			if r.Val.VxlanID != 0 {
+				vni = fmt.Sprintf("%d", r.Val.VxlanID)
 			}
+			neighIP := ""
+			if r.Val.MACAddr != "" && r.Val.MACAddr != "00:00:00:00:00:00" {
+				ipSet := map[string]struct{}{}
+				for _, n := range neighByMAC[r.Val.MACAddr] {
+					if n.VLANID != 0 {
+						if r.Val.VLANID == 0 || n.VLANID != r.Val.VLANID {
+							continue
+						}
+					}
+					if n.VxlanID != 0 {
+						if r.Val.VxlanID == 0 || n.VxlanID != r.Val.VxlanID {
+							continue
+						}
+					}
+					ipSet[n.IP] = struct{}{}
+				}
+				if len(ipSet) > 0 {
+					ips := make([]netip.Addr, 0, len(ipSet))
+					for ipStr := range ipSet {
+						if addr, err := netip.ParseAddr(ipStr); err == nil {
+							ips = append(ips, addr)
+						}
+					}
 
+					sort.Slice(ips, func(i, j int) bool {
+						return ips[i].Less(ips[j])
+					})
+
+					if len(ips) == 1 {
+						neighIP = ips[0].String()
+					} else if len(ips) > 1 {
+						neighIP = fmt.Sprintf("%s (+%d)", ips[0], len(ips)-1)
+					}
+				}
+			}
+			displayRows = append(displayRows, fdbDisplayRow{
+				rec:     r,
+				neighIP: neighIP,
+				vni:     vni,
+			})
+			if r.Val.RemoteVTEP != "" {
+				key := fmt.Sprintf("%s|%s|%d|%s|%d", r.Val.BridgeName, neighIP, r.Val.VLANID, r.Val.PortName, r.Val.VxlanID)
+				remotePresent[key] = struct{}{}
+			}
+		}
+
+		tableRows := make([][]string, 0, len(displayRows))
+		styles := make([]lipgloss.Style, 0, len(displayRows))
+		for _, row := range displayRows {
+			r := row.rec
+			if !m.detailed && r.Val.RemoteVTEP == "" {
+				key := fmt.Sprintf("%s|%s|%d|%s|%d", r.Val.BridgeName, row.neighIP, r.Val.VLANID, r.Val.PortName, r.Val.VxlanID)
+				if _, ok := remotePresent[key]; ok {
+					continue
+				}
+			}
 			tableRows = append(tableRows, []string{
-				fmt.Sprintf("%d", r.Val.VLANId),
-				r.Val.MacAddr,
-				neighIP,
+				fmt.Sprintf("%d", r.Val.VLANID),
+				r.Val.MACAddr,
+				row.neighIP,
 				r.Val.PortName,
-				vxlan_vni,
+				row.vni,
 				r.Val.RemoteVTEP,
 			})
 			st := ui.FadeStyle(r.Meta, now, base)
-			if r.Val.MacAddr == "00:00:00:00:00:00" {
+			if r.Val.MACAddr == "00:00:00:00:00:00" {
 				st = st.Foreground(ui.ColorFdbBum)
 			}
 			styles = append(styles, st)
 		}
-		header, lines := ui.FormatTable(headers, tableRows, m.width-6)
-		for i, ln := range lines {
-			rows = append(rows, ui.ListRow{Text: ln, Style: styles[i]})
-		}
+		header, rows = renderTableRows(headers, tableRows, styles, m.width-6)
 		return header, rows, m.botCursor
 
 	case m.topMode == TopVRF && m.botMode == BottomNeigh:
-		vrf := m.selectedVRF()
+		vrf := pickVRF(data.vrfs, m.vrfCursor)
 		headers := []string{"IP_ADDR", "TYPE", "MAC_ADDR", "IF_NAME", "VNI", "REMOTE_VTEP", "STATE"}
 		var tableRows [][]string
 		var styles []lipgloss.Style
 
 		neighs := m.st.NeighRecords(true)
 		fdbs := m.st.FDBRecords(false)
-
 		type fdbInfo struct {
 			vni    int
 			remote string
 		}
-		macInfo := make(map[string]fdbInfo, len(fdbs))
+		macInfo := make(map[string][]types.FdbEntry, len(fdbs))
 		for _, f := range fdbs {
-			if f.Val.MacAddr == "" {
+			if f.Val.NamespaceID != vrf.NamespaceID || f.Val.MACAddr == "" {
 				continue
 			}
-			if _, ok := macInfo[f.Val.MacAddr]; !ok {
-				macInfo[f.Val.MacAddr] = fdbInfo{vni: f.Val.VxlanId, remote: f.Val.RemoteVTEP}
-			}
+			macInfo[f.Val.MACAddr] = append(macInfo[f.Val.MACAddr], f.Val)
 		}
 
-		filterIf, filterOn := m.selectedVrfIfFilter()
-
-		ifSet := make(map[string]bool, len(vrf.Devs))
+		filterIf, filterOn := vrfIfFilter(vrf.Devs, m.vrfDevFilterIdx, m.topMode)
+		ifSet := make(map[string]struct{}, len(vrf.Devs))
 		for _, d := range vrf.Devs {
-			ifSet[d.IfName] = true
+			ifSet[d.InterfaceName] = struct{}{}
 		}
+
 		type neighRow struct {
 			rec    store.Record[types.NeighEntry]
 			vni    int
@@ -206,71 +246,104 @@ func (m Model) buildBottom() (header string, rows []ui.ListRow, cursorIdx int) {
 			mcast  bool
 		}
 		var items []neighRow
-
 		for _, n := range neighs {
-			if !ifSet[n.Val.Interface] {
+			if n.Val.NamespaceID != vrf.NamespaceID {
 				continue
 			}
-			if filterOn && n.Val.Interface != filterIf {
+			if _, ok := ifSet[n.Val.InterfaceName]; !ok {
 				continue
 			}
-
-			mcast := isMulticastIPStr(n.Val.IP)
+			if filterOn && n.Val.InterfaceName != filterIf {
+				continue
+			}
+			mcast := helpers.IsMulticastIP(n.Val.IP)
 			if mcast && !m.detailed {
 				continue
 			}
-			info := macInfo[n.Val.HardwareAddr]
+			infoSet := map[fdbInfo]struct{}{}
+			for _, f := range macInfo[n.Val.MACAddr] {
+				if n.Val.VLANID != 0 {
+					if f.VLANID == 0 || f.VLANID != n.Val.VLANID {
+						continue
+					}
+				}
+				if n.Val.VxlanID != 0 {
+					if f.VxlanID == 0 || f.VxlanID != n.Val.VxlanID {
+						continue
+					}
+				}
+				infoSet[fdbInfo{vni: f.VxlanID, remote: f.RemoteVTEP}] = struct{}{}
+			}
+			info := fdbInfo{}
+			if len(infoSet) == 1 {
+				for candidate := range infoSet {
+					info = candidate
+				}
+			}
 			items = append(items, neighRow{rec: n, vni: info.vni, remote: info.remote, mcast: mcast})
 		}
 
 		sort.Slice(items, func(i, j int) bool {
 			a, b := items[i], items[j]
-			fa := ipFamilyOrderFromAddrStr(a.rec.Val.IP)
-			fb := ipFamilyOrderFromAddrStr(b.rec.Val.IP)
+			fa := helpers.IpFamilyOrderFromAddrStr(a.rec.Val.IP)
+			fb := helpers.IpFamilyOrderFromAddrStr(b.rec.Val.IP)
 			if fa != fb {
 				return fa < fb
 			}
-			if a.rec.Val.HardwareAddr != b.rec.Val.HardwareAddr {
-				return a.rec.Val.HardwareAddr < b.rec.Val.HardwareAddr
+			if a.rec.Val.MACAddr != b.rec.Val.MACAddr {
+				return a.rec.Val.MACAddr < b.rec.Val.MACAddr
 			}
-			if a.rec.Val.Interface != b.rec.Val.Interface {
-				return a.rec.Val.Interface < b.rec.Val.Interface
+			if a.rec.Val.InterfaceName != b.rec.Val.InterfaceName {
+				return a.rec.Val.InterfaceName < b.rec.Val.InterfaceName
 			}
 			return a.rec.Val.IP < b.rec.Val.IP
 		})
 
 		for _, it := range items {
 			typeStr := "UCAST"
+			vni := ""
+			if it.vni != 0 {
+				vni = fmt.Sprintf("%d", it.vni)
+			}
 			st := ui.FadeStyle(it.rec.Meta, now, base)
 			if it.mcast {
 				typeStr = "MCAST"
 				st = st.Foreground(ui.ColorRouteMcast)
 			}
+			switch it.rec.Val.State {
+			case unix.NUD_INCOMPLETE:
+				st = st.Foreground(ui.ColorNeighIncomplete)
+			case unix.NUD_FAILED:
+				st = st.Foreground(ui.ColorNeighFailed)
+			}
 			tableRows = append(tableRows, []string{
 				it.rec.Val.IP,
 				typeStr,
-				it.rec.Val.HardwareAddr,
-				it.rec.Val.Interface,
-				fmt.Sprintf("%d", it.vni),
+				it.rec.Val.MACAddr,
+				it.rec.Val.InterfaceName,
+				vni,
 				it.remote,
-				fmt.Sprintf("%d", it.rec.Val.State),
+				helpers.FormatNeighState(it.rec.Val.State),
 			})
 			styles = append(styles, st)
 		}
-		header, lines := ui.FormatTable(headers, tableRows, m.width-6)
-		for i, ln := range lines {
-			rows = append(rows, ui.ListRow{Text: ln, Style: styles[i]})
-		}
+		header, rows = renderTableRows(headers, tableRows, styles, m.width-6)
 		return header, rows, m.botCursor
 
 	case m.topMode == TopVRF && m.botMode == BottomRoute:
-		vrf := m.selectedVRF()
+		vrf := pickVRF(data.vrfs, m.vrfCursor)
 		headers := []string{"    ", "DESTINATION", "GATEWAY", "DEVICE"}
+		specs := []ui.ColumnSpec{
+			{},
+			{MinWidth: 19},
+			{MinWidth: 16},
+			{},
+		}
 		var tableRows [][]string
 		var styles []lipgloss.Style
 
 		routes := m.st.RouteRecords(true)
-		filterIf, filterOn := m.selectedVrfIfFilter()
+		filterIf, filterOn := vrfIfFilter(vrf.Devs, m.vrfDevFilterIdx, m.topMode)
 
 		type routeItem struct {
 			rr     store.Record[types.RouteEntry]
@@ -282,15 +355,13 @@ func (m Model) buildBottom() (header string, rows []ui.ListRow, cursorIdx int) {
 
 		for _, rr := range routes {
 			r := rr.Val
-			if r.Table != vrf.TableID {
-				if vrf.TableID == defaultVRFTableID && r.Table == mainRouteTableID {
-					// In Default VRF, show routes from Main Table (255) as well
-				} else {
-					continue
-				}
-
+			if r.NamespaceID != vrf.NamespaceID {
+				continue
 			}
-			if (!m.detailed && (r.Type == unix.RTN_MULTICAST || r.Type == unix.RTN_BROADCAST)) || (r.Type == unix.RTN_ANYCAST) {
+			if !matchesVRFRouteTable(vrf.TableID, r.Table) {
+				continue
+			}
+			if (!m.detailed && (r.Type == unix.RTN_MULTICAST || r.Type == unix.RTN_BROADCAST)) || r.Type == unix.RTN_ANYCAST {
 				continue
 			}
 
@@ -310,9 +381,12 @@ func (m Model) buildBottom() (header string, rows []ui.ListRow, cursorIdx int) {
 				}
 				return nhs[i].Gw < nhs[j].Gw
 			})
-			minDev := nhs[0].Dev
-			fam := routeFamilyOrder(r.Dst, nhs[0].Gw)
-			items = append(items, routeItem{rr: rr, nhs: nhs, fam: fam, minDev: minDev})
+			items = append(items, routeItem{
+				rr:     rr,
+				nhs:    nhs,
+				fam:    helpers.RouteFamilyOrder(r.Dst, nhs[0].Gw),
+				minDev: nhs[0].Dev,
+			})
 		}
 
 		sort.Slice(items, func(i, j int) bool {
@@ -362,7 +436,6 @@ func (m Model) buildBottom() (header string, rows []ui.ListRow, cursorIdx int) {
 			case unix.RTN_BROADCAST, unix.RTN_MULTICAST:
 				st = st.Foreground(ui.ColorRouteBcast)
 			}
-
 			for i, nh := range it.nhs {
 				dstStr := r.Dst
 				typeStr := prefix
@@ -375,10 +448,77 @@ func (m Model) buildBottom() (header string, rows []ui.ListRow, cursorIdx int) {
 			}
 		}
 
-		header, lines := ui.FormatTable(headers, tableRows, m.width-6)
-		for i, ln := range lines {
-			rows = append(rows, ui.ListRow{Text: ln, Style: styles[i]})
+		header, rows = renderTableRowsWithSpecs(headers, tableRows, specs, styles, m.width-6)
+		return header, rows, m.botCursor
+
+	case m.topMode == TopNETNS && m.botMode == BottomProcess:
+		ns := pickNETNS(data.netns, m.netnsCursor)
+		if ns.DisplayName == "" {
+			return "", nil, 0
 		}
+		if ns.PermissionErr != "" {
+			return "", errorRows("Error: " + ns.PermissionErr), 0
+		}
+
+		headers := []string{"PID", "COMMAND", "USER", "LOAD(%)"}
+		specs := []ui.ColumnSpec{
+			{},
+			{MaxWidth: 40},
+			{},
+			{},
+		}
+		procs := m.st.NamespaceProcessRecords(ns.ID, true)
+		tableRows := make([][]string, 0, len(procs))
+		styles := make([]lipgloss.Style, 0, len(procs))
+		for _, proc := range procs {
+			load := ""
+			if proc.Val.LoadPct > 0 {
+				load = fmt.Sprintf("%.1f", proc.Val.LoadPct)
+			}
+			tableRows = append(tableRows, []string{
+				fmt.Sprintf("%d", proc.Val.PID),
+				proc.Val.Exe,
+				proc.Val.User,
+				load,
+			})
+			styles = append(styles, ui.FadeStyle(proc.Meta, now, base))
+		}
+		header, rows = renderTableRowsWithSpecs(headers, tableRows, specs, styles, m.width-6)
+		return header, rows, m.botCursor
+
+	case m.topMode == TopNETNS && m.botMode == BottomLink:
+		ns := pickNETNS(data.netns, m.netnsCursor)
+		if ns.DisplayName == "" {
+			return "", nil, 0
+		}
+		if ns.PermissionErr != "" {
+			return "", errorRows("Error: " + ns.PermissionErr), 0
+		}
+
+		headers := []string{"NAME", "TYPE", "RX", "TX", "RX-ERR", "TX-ERR"}
+		specs := []ui.ColumnSpec{
+			{},
+			{},
+			{MinWidth: 8},
+			{MinWidth: 8},
+			{},
+			{},
+		}
+		links := m.st.NamespaceLinkRecords(ns.ID, true)
+		tableRows := make([][]string, 0, len(links))
+		styles := make([]lipgloss.Style, 0, len(links))
+		for _, link := range links {
+			tableRows = append(tableRows, []string{
+				link.Val.Name,
+				link.Val.Type,
+				helpers.FormatBps(link.Val.RxBps),
+				helpers.FormatBps(link.Val.TxBps),
+				fmt.Sprintf("%d", link.Val.RxErrors),
+				fmt.Sprintf("%d", link.Val.TxErrors),
+			})
+			styles = append(styles, ui.FadeStyle(link.Meta, now, base))
+		}
+		header, rows = renderTableRowsWithSpecs(headers, tableRows, specs, styles, m.width-6)
 		return header, rows, m.botCursor
 	}
 

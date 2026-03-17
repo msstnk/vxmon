@@ -3,13 +3,14 @@ package app
 import (
 	"strings"
 
+	"github.com/msstnk/vxmon/internal/ui"
+
 	"github.com/charmbracelet/lipgloss"
-	"vxmon/internal/ui"
 )
 
 // help_overlay.go renders the centered help modal shown on demand.
 // withHelpOverlay is called from Model.View when help mode is active.
-func (m Model) withHelpOverlay() string {
+func (m *Model) withHelpOverlay() string {
 	lines := []string{
 		"KEYBINDINGS",
 		"",
@@ -18,13 +19,12 @@ func (m Model) withHelpOverlay() string {
 		"  Tab        : Switch focus (Top/Bottom)",
 		"  Left/Right : Switch view/mode",
 		"  Up/Down    : Move next/previous (VRF, Bridge, Route, etc)",
+		"  PgDn/PgUp  : Move by one visible page",
+		"  Home/End   : Move to first/last item",
+		"  t / T      : Change top pane height (30%-60%)",
 		"  d          : Toggle detailed view (show multicast, etc)",
 		"  h / ?      : Toggle this help (any key to close)",
-		"",
-		"VRF View (Top):",
-		"  . ,        : Select next/previous interface to filter",
-		"Bridge View (Top):",
-		"  . ,        : Select next/previous bridge port",
+		"  . / ,      : Move to next/previous child item",
 		"",
 		"Route View legend:",
 		"  B : BGP (proto 11/17/186)",

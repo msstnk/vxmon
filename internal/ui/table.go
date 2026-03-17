@@ -10,9 +10,18 @@ import (
 )
 
 // table.go formats header/data rows into fixed-width strings for pane rendering.
+type ColumnSpec struct {
+	MinWidth int
+	MaxWidth int
+}
+
 // FormatTable is called from app/bottom_view for FDB, Neigh, and Route tables.
 func FormatTable(headers []string, rows [][]string, maxWidth int) (string, []string) {
-	colWidths := fitColumnWidths(headers, rows, maxWidth)
+	return FormatTableWithSpecs(headers, rows, nil, maxWidth)
+}
+
+func FormatTableWithSpecs(headers []string, rows [][]string, specs []ColumnSpec, maxWidth int) (string, []string) {
+	colWidths := fitColumnWidths(headers, rows, specs, maxWidth)
 
 	var headStr string
 	if len(headers) > 0 {
@@ -28,7 +37,11 @@ func FormatTable(headers []string, rows [][]string, maxWidth int) (string, []str
 
 // FormatRows is called from app/top_view.go to align rows without a header line.
 func FormatRows(rows [][]string, maxWidth int) []string {
-	colWidths := fitColumnWidths(nil, rows, maxWidth)
+	return FormatRowsWithSpecs(rows, nil, maxWidth)
+}
+
+func FormatRowsWithSpecs(rows [][]string, specs []ColumnSpec, maxWidth int) []string {
+	colWidths := fitColumnWidths(nil, rows, specs, maxWidth)
 	res := make([]string, 0, len(rows))
 	for _, row := range rows {
 		res = append(res, formatRow(row, colWidths))
@@ -36,12 +49,15 @@ func FormatRows(rows [][]string, maxWidth int) []string {
 	return res
 }
 
-func fitColumnWidths(headers []string, rows [][]string, maxWidth int) []int {
+func fitColumnWidths(headers []string, rows [][]string, specs []ColumnSpec, maxWidth int) []int {
 	colCount := len(headers)
 	for _, row := range rows {
 		if len(row) > colCount {
 			colCount = len(row)
 		}
+	}
+	if len(specs) > colCount {
+		colCount = len(specs)
 	}
 	if colCount == 0 {
 		return nil
@@ -73,6 +89,17 @@ func fitColumnWidths(headers []string, rows [][]string, maxWidth int) []int {
 			}
 		}
 	}
+	for i := range colWidths {
+		if i >= len(specs) {
+			continue
+		}
+		if specs[i].MinWidth > colWidths[i] {
+			colWidths[i] = specs[i].MinWidth
+		}
+		if specs[i].MaxWidth > 0 && colWidths[i] > specs[i].MaxWidth {
+			colWidths[i] = specs[i].MaxWidth
+		}
+	}
 
 	if maxWidth <= 0 {
 		return colWidths
@@ -91,10 +118,10 @@ func fitColumnWidths(headers []string, rows [][]string, maxWidth int) []int {
 	}
 
 	type colStat struct {
-		idx int
-		avg int
+		idx  int
+		avg  int
 		diff int
-		max int
+		max  int
 	}
 
 	stats := make([]colStat, 0, colCount)
@@ -138,6 +165,9 @@ func fitColumnWidths(headers []string, rows [][]string, maxWidth int) []int {
 			continue
 		}
 		target := stat.avg
+		if stat.idx < len(specs) && specs[stat.idx].MinWidth > target {
+			target = specs[stat.idx].MinWidth
+		}
 		if target < 1 {
 			target = 1
 		}
@@ -166,7 +196,11 @@ func fitColumnWidths(headers []string, rows [][]string, maxWidth int) []int {
 		if overflow <= 0 {
 			break
 		}
-		reducible := colWidths[stat.idx] - 1
+		target := 1
+		if stat.idx < len(specs) && specs[stat.idx].MinWidth > 0 && totalMinWidth(specs, colCount, separatorWidth) <= maxWidth {
+			target = specs[stat.idx].MinWidth
+		}
+		reducible := colWidths[stat.idx] - target
 		if reducible <= 0 {
 			continue
 		}
@@ -178,6 +212,18 @@ func fitColumnWidths(headers []string, rows [][]string, maxWidth int) []int {
 	}
 
 	return colWidths
+}
+
+func totalMinWidth(specs []ColumnSpec, colCount int, separatorWidth int) int {
+	total := separatorWidth
+	for i := 0; i < colCount; i++ {
+		width := 1
+		if i < len(specs) && specs[i].MinWidth > width {
+			width = specs[i].MinWidth
+		}
+		total += width
+	}
+	return total
 }
 
 func formatRow(row []string, colWidths []int) string {

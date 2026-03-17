@@ -1,6 +1,8 @@
 package store
 
 import (
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -12,6 +14,33 @@ func reconcile[T any](
 	newList []T,
 	keyFn func(T) string,
 	fpFn func(T) string,
+	now time.Time,
+) (map[string]T, map[string]Meta) {
+	return reconcileScoped(oldMap, oldMeta, newList, keyFn, fpFn, func(string) bool { return true }, now)
+}
+
+func reconcileNamespace[T any](
+	oldMap map[string]T,
+	oldMeta map[string]Meta,
+	newList []T,
+	keyFn func(T) string,
+	fpFn func(T) string,
+	namespaceID uint64,
+	now time.Time,
+) (map[string]T, map[string]Meta) {
+	prefix := strconv.FormatUint(namespaceID, 10) + "|"
+	return reconcileScoped(oldMap, oldMeta, newList, keyFn, fpFn, func(key string) bool {
+		return strings.HasPrefix(key, prefix)
+	}, now)
+}
+
+func reconcileScoped[T any](
+	oldMap map[string]T,
+	oldMeta map[string]Meta,
+	newList []T,
+	keyFn func(T) string,
+	fpFn func(T) string,
+	shouldRemove func(string) bool,
 	now time.Time,
 ) (map[string]T, map[string]Meta) {
 	newMap := make(map[string]T, len(newList))
@@ -49,6 +78,9 @@ func reconcile[T any](
 	}
 
 	for k := range oldMap {
+		if !shouldRemove(k) {
+			continue
+		}
 		if _, exists := newMap[k]; exists {
 			continue
 		}

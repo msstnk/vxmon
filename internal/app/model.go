@@ -8,8 +8,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"vxmon/internal/store"
-	"vxmon/internal/ui"
+	"github.com/msstnk/vxmon/internal/constants"
+	"github.com/msstnk/vxmon/internal/debuglog"
+	"github.com/msstnk/vxmon/internal/store"
+	"github.com/msstnk/vxmon/internal/ui"
 )
 
 // model.go owns the Bubble Tea update loop, input handling, and viewport state.
@@ -18,12 +20,18 @@ type TopMode string
 type BottomMode string
 
 const (
-	TopBridge   TopMode    = "bridge"
-	TopVRF      TopMode    = "vrf"
-	BottomFDB   BottomMode = "fdb"
-	BottomNeigh BottomMode = "neigh"
-	BottomRoute BottomMode = "route"
+	TopBridge TopMode = "bridge"
+	TopVRF    TopMode = "vrf"
+	TopNETNS  TopMode = "netns"
+
+	BottomFDB     BottomMode = "fdb"
+	BottomNeigh   BottomMode = "neigh"
+	BottomRoute   BottomMode = "route"
+	BottomProcess BottomMode = "process"
+	BottomLink    BottomMode = "link"
 )
+
+var topModeCycle = []TopMode{TopBridge, TopVRF, TopNETNS}
 
 // Model is created in cmd/vxmon/main and then owned by Bubble Tea's single update loop.
 type Model struct {
@@ -37,10 +45,14 @@ type Model struct {
 	bridgeDevFilterIdx int
 	vrfCursor          int
 	vrfDevFilterIdx    int
+	netnsCursor        int
 	botCursor          int
 	botViewport        int
 
 	topViewport int
+	topVisible  int
+
+	topPanePercent int
 
 	width  int
 	height int
@@ -48,55 +60,109 @@ type Model struct {
 	clock     time.Time
 	fadeClock time.Time
 
+	fadeTickActive bool
+
 	topRows          []ui.ListRow
 	topCursorRowIdx  int
 	bottomHeaderStr  string
 	bottomRows       []ui.ListRow
 	bottomCursorIdx  int
-	bottomTotalLines int
 	detailed         bool
 	showHelp         bool
 	helpDirty        bool
+	savedBottomModes map[TopMode]BottomMode
+
+	headerCache     string
+	topPaneCache    string
+	bottomPaneCache string
+	baseCache       string
+
+	topParentMeta  map[string]store.Meta
+	topParentReady bool
+
+	nsReloadRefreshedAt map[uint64]time.Time
+	nsReloadDirty       map[uint64]nlReloadMask
+	nsReloadDueAt       map[uint64]time.Time
+	nsReloadPending     map[uint64]bool
 }
 
-// NewModel is called from cmd/vxmon/main to initialize UI state and the first snapshot.
 func NewModel(st *store.Store) Model {
+	now := time.Now()
 	m := Model{
-		st:                 st,
-		focusTop:           true,
-		topMode:            TopBridge,
-		botMode:            BottomFDB,
-		clock:              time.Now(),
-		fadeClock:          time.Now(),
-		bridgeDevFilterIdx: -1,
-		vrfDevFilterIdx:    -1,
+		st:                  st,
+		focusTop:            true,
+		topMode:             TopVRF,
+		botMode:             BottomRoute,
+		clock:               now,
+		fadeClock:           now,
+		bridgeDevFilterIdx:  -1,
+		vrfDevFilterIdx:     -1,
+		topPanePercent:      constants.DefaultTopPanePercent,
+		savedBottomModes:    make(map[TopMode]BottomMode, len(topModeCycle)),
+		topParentMeta:       make(map[string]store.Meta),
+		nsReloadRefreshedAt: make(map[uint64]time.Time),
+		nsReloadDirty:       make(map[uint64]nlReloadMask),
+		nsReloadDueAt:       make(map[uint64]time.Time),
+		nsReloadPending:     make(map[uint64]bool),
 	}
-	_ = st.ReloadAll(time.Now())
-	m.refreshView()
+	_ = st.ReloadAll(now)
+	m.refreshAll()
+	m.fadeTickActive = st.HasActiveFades() || m.hasActiveTopParentFades()
 	return m
 }
 
-// Init is called by Bubble Tea once to register periodic timers.
-func (m Model) Init() tea.Cmd {
-	return tea.Batch(clockTickCmd(), animTickCmd())
+func (m *Model) Init() tea.Cmd {
+	cmds := []tea.Cmd{clockTickCmd()}
+	if m.fadeTickActive {
+		cmds = append(cmds, animTickCmd())
+	}
+	return batchCmds(cmds...)
 }
 
-// clockTickCmd is called from Init and Update to reschedule header clock updates.
 func clockTickCmd() tea.Cmd {
-	return tea.Tick(clockTickInterval, func(t time.Time) tea.Msg { return clockTickMsg(t) })
+	return tea.Tick(constants.ClockTickInterval, func(t time.Time) tea.Msg { return clockTickMsg(t) })
 }
 
-// animTickCmd is called from Init and Update to reschedule fade animation ticks.
 func animTickCmd() tea.Cmd {
-	return tea.Tick(animTickInterval, func(t time.Time) tea.Msg { return animTickMsg(t) })
+	return tea.Tick(constants.AnimTickInterval, func(t time.Time) tea.Msg { return animTickMsg(t) })
 }
 
-// layout is called from Update, refreshView, and View to split pane heights.
-func (m Model) layout() (visibleTop int, visibleBottom int) {
+func batchCmds(cmds ...tea.Cmd) tea.Cmd {
+	filtered := make([]tea.Cmd, 0, len(cmds))
+	for _, cmd := range cmds {
+		if cmd != nil {
+			filtered = append(filtered, cmd)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	default:
+		return tea.Batch(filtered...)
+	}
+}
+
+func (m *Model) paneHeights() (topHeight int, bottomHeight int) {
+	if m.height <= 1 {
+		return 0, 0
+	}
 	paneHeight := m.height - 1
-	half := paneHeight / 2
-	visibleTop = half - 2
-	visibleBottom = paneHeight - half - 3
+	topHeight = paneHeight * m.topPanePercent / 100
+	if paneHeight > 1 {
+		topHeight = clamp(topHeight, 1, paneHeight-1)
+	} else {
+		topHeight = paneHeight
+	}
+	bottomHeight = paneHeight - topHeight
+	return topHeight, bottomHeight
+}
+
+func (m *Model) layout() (visibleTop int, visibleBottom int) {
+	topHeight, bottomHeight := m.paneHeights()
+	visibleTop = topHeight - 2
+	visibleBottom = bottomHeight - 3
 	if visibleTop < 0 {
 		visibleTop = 0
 	}
@@ -106,74 +172,117 @@ func (m Model) layout() (visibleTop int, visibleBottom int) {
 	return
 }
 
-// Update is called by Bubble Tea for all events and drives store reloads and cursor state.
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	debuglog.Tracef("app.Model.Update msg=%T", msg)
 	switch x := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = x.Width
-		m.height = x.Height
-		if m.showHelp {
-			m.helpDirty = true
-		} else {
-			m.refreshView()
-		}
-		return m, nil
 
 	case animTickMsg:
 		now := time.Time(x)
 		m.fadeClock = now
-		if m.st.Advance(now) {
+		changed, active := m.st.Advance(now)
+		topChanged, topActive := m.advanceTopParentFades(now)
+		if changed || active || topChanged || topActive {
 			if m.showHelp {
 				m.helpDirty = true
 			} else {
-				m.refreshView()
+				if topChanged || topActive {
+					m.refreshTopAndBottom()
+				} else {
+					m.refreshBottomOnly()
+				}
 			}
 		}
-		return m, animTickCmd()
+		if active || topActive {
+			m.fadeTickActive = true
+			return m, animTickCmd()
+		}
+		m.fadeTickActive = false
+		return m, nil
 
 	case clockTickMsg:
-		m.clock = time.Time(x)
+		now := time.Time(x)
+		m.clock = now
+		runtimeRefreshed := false
+		if m.st.RuntimeRefreshDue(now) {
+			_ = m.st.ReloadRuntime(now)
+			runtimeRefreshed = true
+		}
 		if m.showHelp {
 			m.helpDirty = true
 		} else {
-			m.refreshView()
+			if runtimeRefreshed {
+				m.refreshHeaderOnly()
+				m.refreshTopAndBottom()
+			} else {
+				m.refreshHeaderOnly()
+			}
+		}
+		if runtimeRefreshed {
+			return m, batchCmds(clockTickCmd(), m.maybeStartFadeTick())
 		}
 		return m, clockTickCmd()
 
-	case store.NeighNLMsg:
-		_ = m.st.ReloadNeighAndFDB(x.At)
-		_ = m.st.ReloadInterfaces()
+	case store.NamespaceSyncMsg:
+		_ = m.st.ReloadAll(x.At)
 		if m.showHelp {
 			m.helpDirty = true
 		} else {
-			m.refreshView()
+			m.refreshAll()
 		}
-		return m, nil
+		return m, m.maybeStartFadeTick()
+
+	case store.NeighNLMsg:
+		cmds := make([]tea.Cmd, 0, 2)
+		cmd := m.scheduleNamespaceReload(nlReloadNeighAndFDB, x.Namespace.ID, x.At)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		cmd = m.scheduleNamespaceReload(nlReloadInterfaces, x.Namespace.ID, x.At)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, batchCmds(cmds...)
 
 	case store.RouteNLMsg:
-		_ = m.st.ReloadRoutes(x.At)
-		_ = m.st.ReloadInterfaces()
-		if m.showHelp {
-			m.helpDirty = true
-		} else {
-			m.refreshView()
+		cmds := make([]tea.Cmd, 0, 2)
+		cmd := m.scheduleNamespaceReload(nlReloadRoutes, x.Namespace.ID, x.At)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
 		}
-		return m, nil
+		cmd = m.scheduleNamespaceReload(nlReloadInterfaces, x.Namespace.ID, x.At)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, batchCmds(cmds...)
 
 	case store.LinkNLMsg:
-		_ = m.st.ReloadInterfaces()
+		cmds := make([]tea.Cmd, 0, 2)
+		cmd := m.scheduleNamespaceReload(nlReloadInterfaces, x.Namespace.ID, x.At)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		cmd = m.scheduleNamespaceReload(nlReloadLinks, x.Namespace.ID, x.At)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, batchCmds(cmds...)
+
+	case nlReloadTickMsg:
+		reloaded, cmd := m.runScheduledNamespaceReload(x)
+		if !reloaded {
+			return m, cmd
+		}
 		if m.showHelp {
 			m.helpDirty = true
 		} else {
-			m.refreshView()
+			m.refreshTopAndBottom()
 		}
-		return m, nil
+		return m, batchCmds(cmd, m.maybeStartFadeTick())
 
 	case tea.MouseMsg:
 		if m.showHelp {
 			return m, nil
 		}
-
 		switch x.Action {
 		case tea.MouseActionPress:
 			switch x.Button {
@@ -186,26 +295,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch x.Button {
 			case tea.MouseButtonLeft:
 				prevFocusTop := m.focusTop
-				if x.Y < m.height/2 {
+				topHeight, _ := m.paneHeights()
+				if x.Y < 1+topHeight {
 					m.focusTop = true
 				} else {
 					m.focusTop = false
 				}
 				if m.focusTop != prevFocusTop {
-					m.refreshView()
+					m.rerenderPanes()
 				}
 			}
 		}
+
 	case tea.KeyMsg:
 		visibleTop, visibleBottom := m.layout()
 		if m.showHelp {
 			m.showHelp = false
 			if m.helpDirty {
-				m.refreshView()
+				m.refreshAll()
 				m.helpDirty = false
 			}
 			return m, nil
 		}
+
+		topDataChanged := false
+		bottomDataChanged := false
+		bottomRenderChanged := false
+		paneRenderChanged := false
+
 		switch x.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -215,45 +332,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "tab":
 			m.focusTop = !m.focusTop
+			paneRenderChanged = true
 		case "d":
 			m.detailed = !m.detailed
-
-		case "left", "right":
+			topDataChanged = true
+		case "t", "T":
+			m.cycleTopPanePercent()
+			topDataChanged = true
+		case "left":
 			if m.focusTop {
-				if m.topMode == TopBridge {
-					m.topMode = TopVRF
-					m.botMode = BottomRoute
-				} else {
-					m.topMode = TopBridge
-					m.botMode = BottomFDB
-				}
-				m.bridgeCursor, m.vrfCursor = 0, 0
-				m.bridgeDevFilterIdx = -1
-				m.vrfDevFilterIdx = -1
-				m.topViewport, m.botCursor, m.botViewport = 0, 0, 0
-
+				m.rememberBottomMode()
+				m.rotateTopMode(-1)
+				topDataChanged = true
 			} else {
-				if m.topMode == TopVRF {
-					if m.botMode == BottomNeigh {
-						m.botMode = BottomRoute
-					} else {
-						m.botMode = BottomNeigh
-					}
-					m.botCursor, m.botViewport = 0, 0
-				}
+				m.rotateBottomMode(-1)
+				bottomDataChanged = true
+			}
+		case "right":
+			if m.focusTop {
+				m.rememberBottomMode()
+				m.rotateTopMode(1)
+				topDataChanged = true
+			} else {
+				m.rotateBottomMode(1)
+				bottomDataChanged = true
 			}
 		case ".", ",":
 			delta := 1
 			if x.String() == "," {
 				delta = -1
 			}
-
 			switch m.topMode {
 			case TopVRF:
 				m.moveVrfDevFilter(delta)
 				m.botCursor, m.botViewport = 0, 0
+				topDataChanged = true
 			case TopBridge:
 				m.moveBridgeDevFilter(delta)
+				m.botCursor, m.botViewport = 0, 0
+				topDataChanged = true
 			}
 		case "down", "up":
 			delta := 1
@@ -262,117 +379,443 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.focusTop {
 				m.moveTopCursor(delta)
+				topDataChanged = true
 			} else {
-				m.botCursor = clamp(m.botCursor+delta, 0, len(m.bottomRows)-1)
-
-				if m.botCursor < m.botViewport {
-					m.botViewport = m.botCursor
+				m.botCursor += delta
+				bottomRenderChanged = true
+			}
+		case "pgdown", "pgup":
+			delta := 1
+			if x.String() == "pgup" {
+				delta = -1
+			}
+			if m.clearTopFilter() {
+				topDataChanged = true
+			}
+			if m.focusTop {
+				m.moveTopPage(delta, visibleTop)
+				topDataChanged = true
+			} else {
+				m.moveBottomPage(delta, visibleBottom)
+				if !topDataChanged {
+					bottomRenderChanged = true
+				}
+			}
+		case "home", "end":
+			last := x.String() == "end"
+			if m.clearTopFilter() {
+				topDataChanged = true
+			}
+			if m.focusTop {
+				m.moveTopBoundary(last)
+				topDataChanged = true
+			} else {
+				m.moveBottomBoundary(last, visibleBottom)
+				if !topDataChanged {
+					bottomRenderChanged = true
 				}
 			}
 		}
 
 		m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
-
 		if m.botCursor < m.botViewport {
 			m.botViewport = m.botCursor
 		} else if m.botCursor >= m.botViewport+visibleBottom {
 			m.botViewport = max(0, m.botCursor-visibleBottom+1)
 		}
 
-		m.refreshViewWithTopViewport(visibleTop)
+		m.rememberBottomMode()
+		switch {
+		case topDataChanged:
+			m.refreshTopAndBottom()
+		case bottomDataChanged:
+			m.refreshBottomOnly()
+		case bottomRenderChanged:
+			m.rerenderBottomOnly()
+		case paneRenderChanged:
+			m.rerenderPanes()
+		default:
+			if visibleTop != m.topVisible {
+				m.refreshTopAndBottom()
+			}
+		}
+		return m, nil
+
+	case tea.WindowSizeMsg:
+		m.width = x.Width
+		m.height = x.Height
+		if m.showHelp {
+			m.helpDirty = true
+		} else {
+			m.refreshAll()
+		}
 		return m, nil
 	}
 
 	return m, nil
 }
 
-// moveTopCursor is called from Update when Up/Down is pressed in the top pane.
+func (m *Model) rotateTopMode(delta int) {
+	idx := 0
+	for i, mode := range topModeCycle {
+		if mode == m.topMode {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + delta + len(topModeCycle)) % len(topModeCycle)
+	m.topMode = topModeCycle[idx]
+	m.botMode = m.bottomModeForTop(m.topMode)
+	m.bridgeDevFilterIdx = -1
+	m.vrfDevFilterIdx = -1
+	m.botCursor, m.botViewport = 0, 0
+	m.topViewport = 0
+}
+
+func (m *Model) cycleTopPanePercent() {
+	next := m.topPanePercent + constants.TopPanePercentStep
+	if next > constants.MaxTopPanePercent {
+		next = constants.MinTopPanePercent
+	}
+	m.topPanePercent = next
+}
+
+func defaultBottomMode(mode TopMode) BottomMode {
+	switch mode {
+	case TopBridge:
+		return BottomFDB
+	case TopNETNS:
+		return BottomLink
+	default:
+		return BottomRoute
+	}
+}
+
+func (m *Model) rotateBottomMode(delta int) {
+	options := bottomModesForTop(m.topMode)
+	if len(options) <= 1 {
+		return
+	}
+	idx := 0
+	for i, mode := range options {
+		if mode == m.botMode {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + delta + len(options)) % len(options)
+	m.botMode = options[idx]
+	m.botCursor, m.botViewport = 0, 0
+}
+
 func (m *Model) moveTopCursor(delta int) {
-	if m.topMode == TopBridge {
+	switch m.topMode {
+	case TopBridge:
 		bridges := m.bridgeItems()
 		m.bridgeCursor = clamp(m.bridgeCursor+delta, 0, len(bridges)-1)
 		if delta != 0 {
 			m.bridgeDevFilterIdx = -1
 		}
-		return
+	case TopNETNS:
+		netnsItems := m.netnsItems()
+		m.netnsCursor = clamp(m.netnsCursor+delta, 0, len(netnsItems)-1)
+	default:
+		vrfs := m.vrfItems()
+		m.vrfCursor = clamp(m.vrfCursor+delta, 0, len(vrfs)-1)
+		if delta != 0 {
+			m.vrfDevFilterIdx = -1
+		}
 	}
-	vrfs := m.vrfItems()
-	m.vrfCursor = clamp(m.vrfCursor+delta, 0, len(vrfs)-1)
-	if delta != 0 {
+	m.botCursor, m.botViewport = 0, 0
+}
+
+func (m *Model) moveTopPage(delta int, visibleTop int) {
+	step := visibleTop
+	if step < 1 {
+		step = 1
+	}
+	m.moveTopCursor(delta * step)
+}
+
+func (m *Model) moveTopBoundary(last bool) {
+	switch m.topMode {
+	case TopBridge:
+		bridges := m.bridgeItems()
+		if last {
+			m.bridgeCursor = max(0, len(bridges)-1)
+		} else {
+			m.bridgeCursor = 0
+		}
+		m.bridgeDevFilterIdx = -1
+	case TopNETNS:
+		items := m.netnsItems()
+		if last {
+			m.netnsCursor = max(0, len(items)-1)
+		} else {
+			m.netnsCursor = 0
+		}
+	default:
+		vrfs := m.vrfItems()
+		if last {
+			m.vrfCursor = max(0, len(vrfs)-1)
+		} else {
+			m.vrfCursor = 0
+		}
 		m.vrfDevFilterIdx = -1
 	}
+	m.botCursor, m.botViewport = 0, 0
 }
 
-// refreshView is called from Update when full top viewport recalculation is needed.
-func (m *Model) refreshView() {
-	visibleTop, _ := m.layout()
-	m.refreshViewWithTopViewport(visibleTop)
+func (m *Model) moveBottomPage(delta int, visibleBottom int) {
+	step := visibleBottom
+	if step < 1 {
+		step = 1
+	}
+	move := delta * step
+	m.botCursor += move
+	m.botViewport += move
 }
 
-// refreshViewWithTopViewport is called from refreshView and Update after key navigation.
-func (m *Model) refreshViewWithTopViewport(visibleTop int) {
-	m.topRows, m.topCursorRowIdx = m.buildTopRows()
-	m.topCursorRowIdx = clamp(m.topCursorRowIdx, 0, len(m.topRows)-1)
+func (m *Model) moveBottomBoundary(last bool, visibleBottom int) {
+	if last {
+		m.botCursor = max(0, len(m.bottomRows)-1)
+		m.botViewport = max(0, len(m.bottomRows)-visibleBottom)
+		return
+	}
+	m.botCursor = 0
+	m.botViewport = 0
+}
+
+func (m *Model) clearTopFilter() bool {
+	changed := false
+	if m.bridgeDevFilterIdx >= 0 {
+		m.bridgeDevFilterIdx = -1
+		changed = true
+	}
+	if m.vrfDevFilterIdx >= 0 {
+		m.vrfDevFilterIdx = -1
+		changed = true
+	}
+	return changed
+}
+
+func (m *Model) refreshAll() {
+	visibleTop, visibleBottom := m.layout()
+	data := m.currentTopItems()
+	m.syncTopParentMeta(data)
+	m.topVisible = visibleTop
+	m.topRows, m.topCursorRowIdx = m.buildTopRows(visibleTop, data)
 	if visibleTop > 0 {
-		if filterRow, ok := m.selectedTopSubFilterRenderedRow(); ok {
-			minStart := max(0, m.topCursorRowIdx-visibleTop+1)
-			maxStart := m.topCursorRowIdx
-			if filterRow-visibleTop+1 > minStart {
-				minStart = filterRow - visibleTop + 1
-			}
-			if filterRow < maxStart {
-				maxStart = filterRow
-			}
-			if minStart <= maxStart {
-				if m.topViewport < minStart {
-					m.topViewport = minStart
-				}
-				if m.topViewport > maxStart {
-					m.topViewport = maxStart
-				}
-			} else {
-				m.topViewport = clamp(m.topViewport, max(0, m.topCursorRowIdx-visibleTop+1), m.topCursorRowIdx)
-			}
-			if filterRow == m.topViewport+visibleTop-1 && filterRow < len(m.topRows)-1 && m.topViewport < maxStart {
-				m.topViewport++
-			}
-		}
+		m.topViewport = m.adjustTopViewport(visibleTop, data)
 	}
 	if m.topViewport < 0 {
 		m.topViewport = 0
 	}
-
-	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom()
+	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom(data)
 	m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
+	m.rebuildHeaderCache()
+	m.renderTopPane(visibleTop)
+	m.renderBottomPane(visibleBottom)
+	m.rebuildBaseCache()
 }
 
-// View is called by Bubble Tea to render the complete screen each frame.
-func (m Model) View() string {
-	if m.height <= 15 {
-		warn := lipgloss.NewStyle().Foreground(ui.ColorWarn).Bold(true)
-		msg := warn.Render("Terminal height is too small (Minimum: 16)")
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, msg)
+func (m *Model) refreshTopAndBottom() {
+	visibleTop, visibleBottom := m.layout()
+	data := m.currentTopItems()
+	m.syncTopParentMeta(data)
+	m.topVisible = visibleTop
+	m.topRows, m.topCursorRowIdx = m.buildTopRows(visibleTop, data)
+	if visibleTop > 0 {
+		m.topViewport = m.adjustTopViewport(visibleTop, data)
+	}
+	if m.topViewport < 0 {
+		m.topViewport = 0
+	}
+	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom(data)
+	m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
+	m.renderTopPane(visibleTop)
+	m.renderBottomPane(visibleBottom)
+	m.rebuildBaseCache()
+}
+
+func (m *Model) scheduleNamespaceReload(kind nlReloadKind, namespaceID uint64, at time.Time) tea.Cmd {
+	m.namespaceReloadAddDirty(namespaceID, kind)
+	dueAt := at.Add(constants.NLMsgThrottleInterval)
+	last := m.namespaceReloadRefreshedAt(namespaceID)
+	if !last.IsZero() {
+		minDueAt := last.Add(constants.NLMsgThrottleInterval)
+		if minDueAt.After(dueAt) {
+			dueAt = minDueAt
+		}
+	}
+	m.namespaceReloadSetDueAt(namespaceID, dueAt)
+	if m.namespaceReloadPending(namespaceID) {
+		return nil
 	}
 
+	m.namespaceReloadSetPending(namespaceID, true)
+	return tea.Tick(time.Until(dueAt), func(t time.Time) tea.Msg {
+		return nlReloadTickMsg{NamespaceID: namespaceID, At: t}
+	})
+}
+
+func (m *Model) runScheduledNamespaceReload(msg nlReloadTickMsg) (bool, tea.Cmd) {
+	namespaceID := msg.NamespaceID
+	if !m.namespaceReloadPending(namespaceID) {
+		return false, nil
+	}
+	dueAt := m.namespaceReloadDueAt(namespaceID)
+	at := msg.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if dueAt.After(at) {
+		return false, tea.Tick(time.Until(dueAt), func(t time.Time) tea.Msg {
+			return nlReloadTickMsg{NamespaceID: namespaceID, At: t}
+		})
+	}
+	m.namespaceReloadSetPending(namespaceID, false)
+	dirty := m.namespaceReloadTakeDirty(namespaceID)
+	if dirty == 0 {
+		m.namespaceReloadClearDueAt(namespaceID)
+		return false, nil
+	}
+	m.namespaceReloadClearDueAt(namespaceID)
+	if dirty&nlReloadMaskForKind(nlReloadInterfaces) != 0 {
+		m.applyNamespaceReload(nlReloadInterfaces, namespaceID, at)
+	}
+	if dirty&nlReloadMaskForKind(nlReloadNeighAndFDB) != 0 {
+		m.applyNamespaceReload(nlReloadNeighAndFDB, namespaceID, at)
+	}
+	if dirty&nlReloadMaskForKind(nlReloadRoutes) != 0 {
+		m.applyNamespaceReload(nlReloadRoutes, namespaceID, at)
+	}
+	if dirty&nlReloadMaskForKind(nlReloadLinks) != 0 {
+		m.applyNamespaceReload(nlReloadLinks, namespaceID, at)
+	}
+	m.namespaceReloadSetRefreshedAt(namespaceID, at)
+	return true, nil
+}
+
+func (m *Model) applyNamespaceReload(kind nlReloadKind, namespaceID uint64, at time.Time) {
+	switch kind {
+	case nlReloadNeighAndFDB:
+		_ = m.st.ReloadNamespaceNeighAndFDB(namespaceID, at)
+	case nlReloadRoutes:
+		_ = m.st.ReloadNamespaceRoutes(namespaceID, at)
+	case nlReloadLinks:
+		_ = m.st.ReloadNamespaceLinks(namespaceID, at)
+	default:
+		_ = m.st.ReloadNamespaceInterfaces(namespaceID)
+	}
+}
+
+func nlReloadMaskForKind(kind nlReloadKind) nlReloadMask {
+	return 1 << kind
+}
+
+func (m *Model) namespaceReloadRefreshedAt(namespaceID uint64) time.Time {
+	return m.nsReloadRefreshedAt[namespaceID]
+}
+
+func (m *Model) namespaceReloadSetRefreshedAt(namespaceID uint64, at time.Time) {
+	m.nsReloadRefreshedAt[namespaceID] = at
+}
+
+func (m *Model) namespaceReloadPending(namespaceID uint64) bool {
+	return m.nsReloadPending[namespaceID]
+}
+
+func (m *Model) namespaceReloadDueAt(namespaceID uint64) time.Time {
+	return m.nsReloadDueAt[namespaceID]
+}
+
+func (m *Model) namespaceReloadSetPending(namespaceID uint64, pending bool) {
+	if pending {
+		m.nsReloadPending[namespaceID] = true
+		return
+	}
+	delete(m.nsReloadPending, namespaceID)
+}
+
+func (m *Model) namespaceReloadSetDueAt(namespaceID uint64, at time.Time) {
+	m.nsReloadDueAt[namespaceID] = at
+}
+
+func (m *Model) namespaceReloadClearDueAt(namespaceID uint64) {
+	delete(m.nsReloadDueAt, namespaceID)
+}
+
+func (m *Model) namespaceReloadAddDirty(namespaceID uint64, kind nlReloadKind) {
+	m.nsReloadDirty[namespaceID] |= nlReloadMaskForKind(kind)
+}
+
+func (m *Model) namespaceReloadTakeDirty(namespaceID uint64) nlReloadMask {
+	dirty := m.nsReloadDirty[namespaceID]
+	delete(m.nsReloadDirty, namespaceID)
+	return dirty
+}
+
+func (m *Model) refreshBottomOnly() {
+	_, visibleBottom := m.layout()
+	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom(m.currentTopItems())
+	m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
+	m.renderBottomPane(visibleBottom)
+	m.rebuildBaseCache()
+}
+
+func (m *Model) rerenderBottomOnly() {
+	_, visibleBottom := m.layout()
+	m.renderBottomPane(visibleBottom)
+	m.rebuildBaseCache()
+}
+
+func (m *Model) rerenderPanes() {
+	visibleTop, visibleBottom := m.layout()
+	m.renderTopPane(visibleTop)
+	m.renderBottomPane(visibleBottom)
+	m.rebuildBaseCache()
+}
+
+func (m *Model) refreshHeaderOnly() {
+	m.rebuildHeaderCache()
+	m.rebuildBaseCache()
+}
+
+func (m *Model) rebuildHeaderCache() {
 	timeStr := m.clock.Format("2006-01-02 15:04:05")
-	leftTitle := appTitle
+	leftTitle := constants.AppTitle
 	rightStr := timeStr + "   "
 	spaces := m.width - lipgloss.Width(leftTitle) - lipgloss.Width(rightStr)
-	var headerView string
 	if spaces > 0 {
-		headerView = leftTitle + strings.Repeat(" ", spaces) + rightStr
-	} else {
-		headerView = leftTitle + "\n" + rightStr
+		m.headerCache = leftTitle + strings.Repeat(" ", spaces) + rightStr
+		return
 	}
+	m.headerCache = leftTitle + "\n" + rightStr
+}
 
+func (m *Model) renderTopPane(visibleTop int) {
+	if m.width <= 1 || m.height <= 1 {
+		m.topPaneCache = ""
+		return
+	}
 	paneHeight := m.height - 1
-	half := paneHeight / 2
-	visibleTop, visibleBottom := m.layout()
-
+	topHeight, _ := m.paneHeights()
 	topTitle := fmt.Sprintf("  %s  ", strings.ToUpper(string(m.topMode)))
 	topContent := ui.RenderList(m.topRows, m.topCursorRowIdx, m.topViewport, visibleTop)
-	topPane := ui.RenderPane(topTitle, topContent, m.width, half, m.focusTop)
+	if paneHeight < 0 {
+		paneHeight = 0
+	}
+	m.topPaneCache = ui.RenderPane(topTitle, topContent, m.width, topHeight, m.focusTop)
+}
 
+func (m *Model) renderBottomPane(visibleBottom int) {
+	if m.width <= 1 || m.height <= 1 {
+		m.bottomPaneCache = ""
+		return
+	}
+	paneHeight := m.height - 1
+	_, bottomHeight := m.paneHeights()
 	botTitle := fmt.Sprintf("  %s  ", strings.ToUpper(string(m.botMode)))
 	botContent := m.bottomHeaderStr
 	if botContent != "" {
@@ -386,17 +829,62 @@ func (m Model) View() string {
 			botContent = botLines
 		}
 	}
-	botPane := ui.RenderPane(botTitle, botContent, m.width, paneHeight-half, !m.focusTop)
+	if paneHeight < 0 {
+		paneHeight = 0
+	}
+	m.bottomPaneCache = ui.RenderPane(botTitle, botContent, m.width, bottomHeight, !m.focusTop)
+}
 
-	base := headerView + "\n" + lipgloss.JoinVertical(lipgloss.Left, topPane, botPane)
+func (m *Model) rebuildBaseCache() {
+	m.baseCache = m.headerCache + "\n" + lipgloss.JoinVertical(lipgloss.Left, m.topPaneCache, m.bottomPaneCache)
+}
+
+func (m *Model) maybeStartFadeTick() tea.Cmd {
+	if m.fadeTickActive || (!m.st.HasActiveFades() && !m.hasActiveTopParentFades()) {
+		return nil
+	}
+	debuglog.Tracef("app.startFadeTick")
+	m.fadeTickActive = true
+	return animTickCmd()
+}
+
+func (m *Model) adjustTopViewport(visibleTop int, data topItems) int {
+	if visibleTop <= 0 || len(m.topRows) == 0 {
+		return 0
+	}
+
+	viewport := clamp(m.topViewport, 0, max(0, len(m.topRows)-visibleTop))
+	selectedRow, hasChild := m.selectedTopSubFilterRenderedRow(data)
+	if !hasChild {
+		selectedRow = m.topCursorRowIdx
+	}
+
+	if m.topMode == TopBridge && hasChild {
+		parentRow := m.topCursorRowIdx
+		return clamp(parentRow, 0, max(0, len(m.topRows)-visibleTop))
+	}
+
+	if selectedRow < viewport {
+		viewport = selectedRow
+	}
+	if selectedRow >= viewport+visibleTop {
+		viewport = selectedRow - visibleTop + 1
+	}
+	return clamp(viewport, 0, max(0, len(m.topRows)-visibleTop))
+}
+
+func (m *Model) View() string {
+	if m.height <= 15 {
+		warn := lipgloss.NewStyle().Foreground(ui.ColorWarn).Bold(true)
+		msg := warn.Render("Terminal height is too small (Minimum: 16)")
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, msg)
+	}
 	if m.showHelp {
 		return m.withHelpOverlay()
 	}
-	return base
-
+	return m.baseCache
 }
 
-// clamp is a local helper called by cursor and viewport calculations in app/model and app/top_view.
 func clamp(x, lo, hi int) int {
 	if hi < lo {
 		return lo
@@ -410,102 +898,141 @@ func clamp(x, lo, hi int) int {
 	return x
 }
 
-// moveVrfDevFilter is called from Update when '.' or ',' is pressed in VRF mode.
+func moveFilterIndex(current int, total int, delta int) int {
+	if total == 0 {
+		return -1
+	}
+	idx := current + delta
+	if delta > 0 && idx >= total {
+		return -1
+	}
+	if delta < 0 && idx < -1 {
+		return -1
+	}
+	return idx
+}
+
 func (m *Model) moveVrfDevFilter(delta int) {
-	displayDevs := m.vrfDisplayDevs(m.selectedVRF())
-	if len(displayDevs) == 0 {
-		m.vrfDevFilterIdx = -1
-		return
-	}
-
-	idx := m.vrfDevFilterIdx + delta
-
-	if delta > 0 && idx >= len(displayDevs) {
-		idx = -1
-	} else if delta < 0 && idx < -1 {
-		idx = -1
-	}
-
-	m.vrfDevFilterIdx = idx
+	displayDevs := m.selectedVRF().Devs
+	m.vrfDevFilterIdx = moveFilterIndex(m.vrfDevFilterIdx, len(displayDevs), delta)
 }
 
-// moveBridgeDevFilter is called from Update when '.' or ',' is pressed in bridge mode.
 func (m *Model) moveBridgeDevFilter(delta int) {
-	items := m.bridgeItems()
-	if len(items) == 0 {
+	bridge := pickBridge(m.bridgeItems(), m.bridgeCursor)
+	if bridge.Info.InterfaceName == "" {
 		m.bridgeDevFilterIdx = -1
 		return
 	}
-
-	bridge := items[clamp(m.bridgeCursor, 0, len(items)-1)]
-	if len(bridge.Devs) == 0 {
-		m.bridgeDevFilterIdx = -1
-		return
-	}
-
-	idx := m.bridgeDevFilterIdx + delta
-
-	if delta > 0 && idx >= len(bridge.Devs) {
-		idx = -1
-	} else if delta < 0 && idx < -1 {
-		idx = -1
-	}
-
-	m.bridgeDevFilterIdx = idx
+	m.bridgeDevFilterIdx = moveFilterIndex(m.bridgeDevFilterIdx, len(bridge.Devs), delta)
 }
 
-// selectedVrfIfFilter is called from top_view.go and bottom_view.go to apply IF filtering.
-func (m Model) selectedVrfIfFilter() (ifName string, ok bool) {
-	if m.topMode != TopVRF {
-		return "", false
-	}
-	if m.vrfDevFilterIdx < 0 {
-		return "", false
-	}
-	vrf := m.selectedVRF()
-	displayDevs := m.vrfDisplayDevs(vrf)
-	if m.vrfDevFilterIdx >= len(displayDevs) {
-		return "", false
-	}
-	return displayDevs[m.vrfDevFilterIdx].IfName, true
-}
-
-// selectedVrfFilterRenderedRow is called from refreshViewWithTopViewport to keep filter rows visible.
-func (m Model) selectedVrfFilterRenderedRow() (int, bool) {
+func (m *Model) selectedVrfFilterRenderedRow(data topItems) (int, bool) {
 	if m.topMode != TopVRF || m.vrfDevFilterIdx < 0 {
 		return 0, false
 	}
-	vrf := m.selectedVRF()
-	displayDevs := m.vrfDisplayDevs(vrf)
+	vrf := pickVRF(data.vrfs, m.vrfCursor)
+	displayDevs := vrf.Devs
 	if m.vrfDevFilterIdx >= len(displayDevs) {
 		return 0, false
 	}
 	return m.topCursorRowIdx + 1 + m.vrfDevFilterIdx, true
 }
 
-// selectedBridgeFilterRenderedRow is called from refreshViewWithTopViewport to keep filter rows visible.
-func (m Model) selectedBridgeFilterRenderedRow() (int, bool) {
+func (m *Model) selectedBridgeFilterRenderedRow(data topItems) (int, bool) {
 	if m.topMode != TopBridge || m.bridgeDevFilterIdx < 0 {
 		return 0, false
 	}
-	items := m.bridgeItems()
-	if len(items) == 0 {
+	bridge := pickBridge(data.bridges, m.bridgeCursor)
+	if bridge.Info.InterfaceName == "" {
 		return 0, false
 	}
-	bridge := items[clamp(m.bridgeCursor, 0, len(items)-1)]
 	if m.bridgeDevFilterIdx >= len(bridge.Devs) {
 		return 0, false
 	}
-	return m.topCursorRowIdx + 1 + m.bridgeDevFilterIdx, true
+	childStart, childEnd := bridgeVisibleChildRange(data.bridges, m.bridgeCursor, m.bridgeDevFilterIdx, m.topVisible, m.topMode)
+	if m.bridgeDevFilterIdx < childStart || m.bridgeDevFilterIdx >= childEnd {
+		return 0, false
+	}
+	return m.topCursorRowIdx + 1 + (m.bridgeDevFilterIdx - childStart), true
 }
 
-// selectedTopSubFilterRenderedRow is called from refreshViewWithTopViewport for mode-specific row lookup.
-func (m Model) selectedTopSubFilterRenderedRow() (int, bool) {
+func (m *Model) selectedTopSubFilterRenderedRow(data topItems) (int, bool) {
 	if m.topMode == TopVRF {
-		return m.selectedVrfFilterRenderedRow()
+		return m.selectedVrfFilterRenderedRow(data)
 	}
 	if m.topMode == TopBridge {
-		return m.selectedBridgeFilterRenderedRow()
+		return m.selectedBridgeFilterRenderedRow(data)
 	}
 	return 0, false
+}
+
+func (m *Model) syncTopParentMeta(data topItems) {
+	keys := m.currentTopFadeKeys(data)
+	if !m.topParentReady {
+		for key := range keys {
+			m.topParentMeta[key] = store.Meta{}
+		}
+		m.topParentReady = true
+		return
+	}
+
+	for key := range m.topParentMeta {
+		if _, ok := keys[key]; !ok {
+			delete(m.topParentMeta, key)
+		}
+	}
+	for key := range keys {
+		if _, ok := m.topParentMeta[key]; ok {
+			continue
+		}
+		m.topParentMeta[key] = store.Meta{
+			State:     store.StateAdded,
+			ChangedAt: m.fadeClock,
+		}
+	}
+}
+
+func (m *Model) currentTopFadeKeys(data topItems) map[string]struct{} {
+	keys := make(map[string]struct{})
+	for _, item := range data.bridges {
+		keys[bridgeParentKey(item)] = struct{}{}
+		for _, dev := range item.Devs {
+			keys[bridgeChildKey(item, dev)] = struct{}{}
+		}
+	}
+	for _, item := range data.vrfs {
+		keys[vrfParentKey(item)] = struct{}{}
+		for _, dev := range item.Devs {
+			keys[vrfChildKey(item, dev)] = struct{}{}
+		}
+	}
+	for _, item := range data.netns {
+		keys[netnsParentKey(item)] = struct{}{}
+	}
+	return keys
+}
+
+func (m *Model) advanceTopParentFades(now time.Time) (changed bool, active bool) {
+	for key, meta := range m.topParentMeta {
+		if meta.State == store.StateNone {
+			continue
+		}
+		if now.Sub(meta.ChangedAt) < constants.FadeDuration {
+			active = true
+			continue
+		}
+		meta.State = store.StateNone
+		m.topParentMeta[key] = meta
+		changed = true
+	}
+	return changed, active
+}
+
+func (m *Model) hasActiveTopParentFades() bool {
+	for _, meta := range m.topParentMeta {
+		if meta.State != store.StateNone {
+			return true
+		}
+	}
+	return false
 }

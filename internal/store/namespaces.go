@@ -1,0 +1,386 @@
+package store
+
+import (
+	"bufio"
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
+
+	"github.com/msstnk/vxmon/internal/debuglog"
+	"github.com/msstnk/vxmon/internal/types"
+)
+
+type namespaceState struct {
+	info       types.NamespaceInfo
+	mountPoint string
+	handle     *netlink.Handle
+}
+
+type discoveredNamespace struct {
+	namespaceID uint64
+	mountPoint  string
+	displayName string
+	shortName   string
+	isRoot      bool
+	isCurrent   bool
+	sortKey     string
+}
+
+func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]discoveredNamespace, error) {
+	if selfNamespaceID == 0 {
+		var err error
+		if selfNamespaceID, err = readNamespaceID("/proc/self/ns/net"); err != nil {
+			return nil, err
+		}
+	}
+
+	// Root IDの特定
+	rootID, err := readNamespaceID("/proc/1/ns/net")
+	if err != nil && (os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
+		rootID = selfNamespaceID
+	} else if err != nil {
+		return nil, err
+	}
+
+	if rootID != selfNamespaceID {
+		if rootHandle, err := netns.GetFromPath("/proc/1/ns/net"); err != nil {
+			if os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+				rootID = selfNamespaceID
+			} else {
+				return nil, err
+			}
+		} else {
+			rootHandle.Close()
+		}
+	}
+
+	if procScan == nil {
+		scan := scanProcfs(false)
+		procScan = &scan
+	}
+
+	byID := make(map[uint64]discoveredNamespace, 8)
+
+	// RootとSelfの初期登録
+	byID[rootID] = discoveredNamespace{
+		namespaceID: rootID,
+		mountPoint:  "/proc/1/ns/net",
+		displayName: "/proc/1/ns/net",
+		shortName:   "root",
+		isRoot:      true,
+		isCurrent:   rootID == selfNamespaceID,
+	}
+	if rootID != selfNamespaceID {
+		byID[selfNamespaceID] = discoveredNamespace{
+			namespaceID: selfNamespaceID,
+			mountPoint:  "/proc/self/ns/net",
+			displayName: "/proc/self/ns/net",
+			shortName:   "self",
+			isCurrent:   true,
+			sortKey:     "/proc/self/ns/net",
+		}
+	} else {
+		// root == self の場合はパスを上書き
+		item := byID[rootID]
+		item.mountPoint = "/proc/self/ns/net"
+		item.displayName = "/proc/self/ns/net"
+		byID[rootID] = item
+	}
+
+	// mountinfo から nsfs を抽出
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+
+		// セパレータ "-" を探し、その直後が "nsfs" か確認
+		sepIdx := -1
+		for i, f := range fields {
+			if f == "-" {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx == -1 || len(fields) <= sepIdx+1 || fields[sepIdx+1] != "nsfs" {
+			continue
+		}
+
+		// nsfsの場合、fields[3] が root (nsIDを含むトークン)、fields[4] が mountPoint
+		nsID, ok := parseNamespaceToken(fields[3])
+		if !ok {
+			continue
+		}
+
+		if existing, exists := byID[nsID]; exists && existing.isRoot {
+			continue
+		}
+
+		mountPoint := fields[4]
+		shortName := filepath.Base(mountPoint)
+		if shortName == "." || shortName == "/" || shortName == "" {
+			shortName = mountPoint
+		}
+
+		byID[nsID] = discoveredNamespace{
+			namespaceID: nsID,
+			mountPoint:  mountPoint,
+			displayName: mountPoint,
+			shortName:   shortName,
+			isCurrent:   nsID == selfNamespaceID,
+			sortKey:     mountPoint,
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	// procScan 結果の統合
+	for nsID, ref := range procScan.namespaces {
+		if existing, exists := byID[nsID]; exists {
+			if existing.isRoot || !isProcNamespacePath(existing.mountPoint) || ref.pid >= procNamespacePID(existing.mountPoint) {
+				continue
+			}
+		}
+		byID[nsID] = discoveredNamespace{
+			namespaceID: nsID,
+			mountPoint:  ref.path,
+			displayName: ref.path,
+			shortName:   ref.path,
+			isCurrent:   nsID == selfNamespaceID,
+			sortKey:     ref.path,
+		}
+	}
+
+	// スライス化とソート
+	items := make([]discoveredNamespace, 0, len(byID))
+	for _, item := range byID {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].isRoot != items[j].isRoot {
+			return items[i].isRoot
+		}
+		return items[i].sortKey < items[j].sortKey
+	})
+
+	return items, nil
+}
+
+func isProcNamespacePath(path string) bool {
+	return strings.HasPrefix(path, "/proc/") && strings.HasSuffix(path, "/ns/net")
+}
+
+func procNamespacePID(path string) int {
+	trimmed := strings.TrimPrefix(path, "/proc/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 0 {
+		return 0
+	}
+	pid, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+func readNamespaceID(path string) (uint64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return 0, err
+	}
+	if stat.Ino == 0 {
+		return 0, errors.New("invalid namespace inode")
+	}
+	return stat.Ino, nil
+}
+
+func parseNamespaceToken(s string) (uint64, bool) {
+	if !strings.HasPrefix(s, "net:[") || !strings.HasSuffix(s, "]") {
+		return 0, false
+	}
+	num := strings.TrimSuffix(strings.TrimPrefix(s, "net:["), "]")
+	v, err := strconv.ParseUint(num, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+func permissionText(err error) string {
+	if err == nil {
+		return ""
+	}
+	if os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		return "no permission"
+	}
+	return err.Error()
+}
+
+func (s *Store) syncNamespaces() error {
+	return s.syncNamespacesWithProcScan(nil)
+}
+
+func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
+	debuglog.Tracef("store.syncNamespaces")
+	discovered, err := discoverNamespaces(s.selfNamespaceID, procScan)
+	if err != nil {
+		return err
+	}
+
+	nextStates := make(map[uint64]*namespaceState, len(discovered))
+	nextList := make([]types.NamespaceInfo, 0, len(discovered))
+
+	for _, item := range discovered {
+		state, ok := s.namespacesByID[item.namespaceID]
+		if ok && state.mountPoint == item.mountPoint && state.info.IsRoot == item.isRoot && state.info.IsCurrent == item.isCurrent {
+			state.info.DisplayName = item.displayName
+			state.info.MountPoint = item.mountPoint
+			state.info.ShortName = item.shortName
+			state.info.IsCurrent = item.isCurrent
+			if state.handle == nil {
+				handle, handleErr := newNamespaceHandle(item)
+				state.handle = handle
+				state.info.PermissionErr = permissionText(handleErr)
+			} else {
+				state.info.PermissionErr = ""
+			}
+			nextStates[item.namespaceID] = state
+			nextList = append(nextList, state.info)
+			continue
+		}
+
+		if ok {
+			if state.handle != nil {
+				state.handle.Close()
+			}
+		}
+
+		info := types.NamespaceInfo{
+			ID:          item.namespaceID,
+			MountPoint:  item.mountPoint,
+			DisplayName: item.displayName,
+			ShortName:   item.shortName,
+			IsRoot:      item.isRoot,
+			IsCurrent:   item.isCurrent,
+		}
+
+		handle, handleErr := newNamespaceHandle(item)
+		info.PermissionErr = permissionText(handleErr)
+		nextStates[item.namespaceID] = &namespaceState{
+			info:       info,
+			mountPoint: item.mountPoint,
+			handle:     handle,
+		}
+		nextList = append(nextList, info)
+	}
+
+	for id, state := range s.namespacesByID {
+		if _, ok := nextStates[id]; ok {
+			continue
+		}
+		debuglog.Infof("store.syncNamespaces remove namespace=%d", id)
+		if state.handle != nil {
+			state.handle.Close()
+		}
+	}
+
+	s.namespacesByID = nextStates
+	s.namespaces = nextList
+	s.pruneNamespaceCaches(nextStates)
+	return nil
+}
+
+func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, error) {
+	if item.isCurrent {
+		return netlink.NewHandleAt(netns.None())
+	}
+
+	nsHandle, err := netns.GetFromPath(item.mountPoint)
+	if err != nil {
+		return nil, err
+	}
+	defer nsHandle.Close()
+
+	return netlink.NewHandleAt(nsHandle)
+}
+
+func (s *Store) namespaceStates() []*namespaceState {
+	out := make([]*namespaceState, 0, len(s.namespaces))
+	for _, ns := range s.namespaces {
+		state := s.namespacesByID[ns.ID]
+		if state == nil {
+			continue
+		}
+		out = append(out, state)
+	}
+	return out
+}
+
+func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
+	for nsID := range s.ifacesByNS {
+		if _, ok := states[nsID]; !ok {
+			delete(s.ifacesByNS, nsID)
+		}
+	}
+	for nsID := range s.processes {
+		if _, ok := states[nsID]; !ok {
+			delete(s.processes, nsID)
+		}
+	}
+	for nsID := range s.links {
+		if _, ok := states[nsID]; !ok {
+			delete(s.links, nsID)
+		}
+	}
+	for key := range s.processRecords {
+		nsID, ok := namespaceIDFromRecordKey(key)
+		if ok {
+			if _, exists := states[nsID]; !exists {
+				delete(s.processRecords, key)
+				delete(s.processMeta, key)
+				delete(s.processPrev, key)
+			}
+		}
+	}
+	for key := range s.linkRecords {
+		nsID, ok := namespaceIDFromRecordKey(key)
+		if ok {
+			if _, exists := states[nsID]; !exists {
+				delete(s.linkRecords, key)
+				delete(s.linkMeta, key)
+				delete(s.linkPrev, key)
+			}
+		}
+	}
+}
+
+func namespaceIDFromRecordKey(key string) (uint64, bool) {
+	head, _, ok := strings.Cut(key, "|")
+	if !ok {
+		return 0, false
+	}
+	nsID, err := strconv.ParseUint(head, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return nsID, true
+}

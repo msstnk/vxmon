@@ -6,7 +6,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"vxmon/internal/store"
+	"github.com/msstnk/vxmon/internal/constants"
+	"github.com/msstnk/vxmon/internal/store"
 )
 
 const (
@@ -39,7 +40,7 @@ func FadeStyle(meta store.Meta, nowUnixNano int64, base lipgloss.Style) lipgloss
 		nowUnixNano = changed
 	}
 
-	dur := store.FadeDuration.Nanoseconds()
+	dur := constants.FadeDuration.Nanoseconds()
 	elapsed := nowUnixNano - changed
 	if elapsed >= dur {
 		if meta.State == store.StateRemoved {

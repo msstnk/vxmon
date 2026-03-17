@@ -19,6 +19,8 @@ const (
 	ColorHelpBackground     lipgloss.Color = "#0f1620"
 	ColorWarn               lipgloss.Color = "196"
 	ColorFdbBum             lipgloss.Color = "#00FFFF"
+	ColorNeighIncomplete    lipgloss.Color = "#ffb3b3"
+	ColorNeighFailed        lipgloss.Color = "#ff6b6b"
 	ColorRouteMcast         lipgloss.Color = "#FFFFCC"
 	ColorRouteBcast         lipgloss.Color = "#90EE90"
 	ColorTopChild           lipgloss.Color = "#9aa4b2"
