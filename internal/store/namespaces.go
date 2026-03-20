@@ -42,7 +42,7 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 		}
 	}
 
-	// Root IDの特定
+	// Identify root Namespace
 	rootID, err := readNamespaceID("/proc/1/ns/net")
 	if err != nil && (os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
 		rootID = selfNamespaceID
@@ -69,7 +69,7 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 
 	byID := make(map[uint64]discoveredNamespace, 8)
 
-	// RootとSelfの初期登録
+	// Initial registration of Root and Self
 	byID[rootID] = discoveredNamespace{
 		namespaceID: rootID,
 		mountPoint:  "/proc/1/ns/net",
@@ -88,14 +88,14 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 			sortKey:     "/proc/self/ns/net",
 		}
 	} else {
-		// root == self の場合はパスを上書き
+		// If root == self, overwrite the path
 		item := byID[rootID]
 		item.mountPoint = "/proc/self/ns/net"
 		item.displayName = "/proc/self/ns/net"
 		byID[rootID] = item
 	}
 
-	// mountinfo から nsfs を抽出
+	// Extract nsfs from mountinfo
 	file, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
 		return nil, err
@@ -106,7 +106,7 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 
-		// セパレータ "-" を探し、その直後が "nsfs" か確認
+		// Look for the separator "-" and check if the token immediately after it is "nsfs"
 		sepIdx := -1
 		for i, f := range fields {
 			if f == "-" {
@@ -118,7 +118,7 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 			continue
 		}
 
-		// nsfsの場合、fields[3] が root (nsIDを含むトークン)、fields[4] が mountPoint
+		// For nsfs, fields[3] is the root (token containing nsID), fields[4] is the mountPoint
 		nsID, ok := parseNamespaceToken(fields[3])
 		if !ok {
 			continue
@@ -148,7 +148,7 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 		return nil, err
 	}
 
-	// procScan 結果の統合
+	// Merge procScan results
 	for nsID, ref := range procScan.namespaces {
 		if existing, exists := byID[nsID]; exists {
 			if existing.isRoot || !isProcNamespacePath(existing.mountPoint) || ref.pid >= procNamespacePID(existing.mountPoint) {
@@ -165,7 +165,7 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 		}
 	}
 
-	// スライス化とソート
+	// Slice and sort
 	items := make([]discoveredNamespace, 0, len(byID))
 	for _, item := range byID {
 		items = append(items, item)
@@ -316,6 +316,20 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 }
 
 func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, netns.NsHandle, error) {
+	if item.isCurrent {
+		// unprivileged-safe behavior for the main handle:
+		handle, err := netlink.NewHandleAt(netns.None())
+		if err != nil {
+			return nil, netns.None(), err
+		}
+		// Best-effort fd for bridge netlink dump path.
+		nsHandle, err := netns.GetFromPath(item.mountPoint)
+		if err != nil {
+			return handle, netns.None(), nil
+		}
+		return handle, nsHandle, nil
+	}
+
 	nsHandle, err := netns.GetFromPath(item.mountPoint)
 	if err != nil {
 		return nil, netns.None(), err
