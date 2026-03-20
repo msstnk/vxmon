@@ -257,14 +257,23 @@ func (m *Model) netnsItems() []netnsItem {
 }
 
 func pickBridge(items []bridgeItem, cursor int) bridgeItem {
+	if len(items) == 0 {
+		return bridgeItem{}
+	}
 	return items[clamp(cursor, 0, len(items)-1)]
 }
 
 func pickVRF(items []vrfItem, cursor int) vrfItem {
+	if len(items) == 0 {
+		return vrfItem{}
+	}
 	return items[clamp(cursor, 0, len(items)-1)]
 }
 
 func pickNETNS(items []netnsItem, cursor int) types.NamespaceInfo {
+	if len(items) == 0 {
+		return types.NamespaceInfo{}
+	}
 	return items[clamp(cursor, 0, len(items)-1)]
 }
 
