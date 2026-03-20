@@ -18,18 +18,25 @@ import (
 func loadBridgeNetlinkStates(ns types.NamespaceInfo, nsHandle int) (map[int]int, map[int]int) {
 	stpByIndex := map[int]int{}
 	portByIndex := map[int]int{}
-	if nsHandle < 0 {
-		return stpByIndex, portByIndex
+	sh := &nl.SocketHandle{}
+	if ns.IsCurrent {
+		sock, err := nl.Subscribe(unix.NETLINK_ROUTE)
+		if err != nil {
+			debuglog.Tracef("store.loadBridgeNetlinkStates Subscribe failed namespace=%d err=%v", ns.ID, err)
+			return stpByIndex, portByIndex
+		}
+		sh = &nl.SocketHandle{Socket: sock}
+		defer sh.Close()
+	} else {
+		nsFD := netns.NsHandle(nsHandle)
+		sock, err := nl.GetNetlinkSocketAt(nsFD, netns.None(), unix.NETLINK_ROUTE)
+		if err != nil {
+			debuglog.Tracef("store.loadBridgeNetlinkStates GetNetlinkSocketAt failed namespace=%d err=%v", ns.ID, err)
+			return stpByIndex, portByIndex
+		}
+		sh = &nl.SocketHandle{Socket: sock}
+		defer sh.Close()
 	}
-
-	nsFD := netns.NsHandle(nsHandle)
-	sock, err := nl.GetNetlinkSocketAt(nsFD, netns.None(), unix.NETLINK_ROUTE)
-	if err != nil {
-		debuglog.Tracef("store.loadBridgeNetlinkStates socket failed namespace=%d err=%v", ns.ID, err)
-		return stpByIndex, portByIndex
-	}
-	sh := &nl.SocketHandle{Socket: sock}
-	defer sh.Close()
 
 	dump := func(family uint8, label string) error {
 		req := nl.NewNetlinkRequest(unix.RTM_GETLINK, unix.NLM_F_DUMP)

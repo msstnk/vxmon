@@ -20,7 +20,7 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) (
 	if err != nil {
 		return nil, fmt.Errorf("LinkList failed: %v", err)
 	}
-
+	stpByIndex, portByIndex := loadBridgeNetlinkStates(ns, nsHandle)
 	indexToName := make(map[int]string, len(links))
 	for _, link := range links {
 		indexToName[link.Attrs().Index] = link.Attrs().Name
@@ -32,17 +32,6 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) (
 		if r.LinkIndex > 0 {
 			linkToTable[r.LinkIndex] = r.Table
 		}
-	}
-
-	var stpByIndex map[int]int
-	var portByIndex map[int]int
-	netlinkStatesLoaded := false
-	loadNetlinkStates := func() {
-		if netlinkStatesLoaded {
-			return
-		}
-		stpByIndex, portByIndex = loadBridgeNetlinkStates(ns, nsHandle)
-		netlinkStatesLoaded = true
 	}
 
 	results := make([]types.InterfaceInfo, 0, len(links))
@@ -88,7 +77,6 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) (
 			}
 		}
 		if linkType == "bridge" {
-			loadNetlinkStates()
 			stp, found := stpByIndex[attrs.Index]
 			if found {
 				info.STPState = stp
@@ -96,7 +84,6 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) (
 			debuglog.Tracef("store.bridgeSTPState netlink if=%s index=%d found=%t val=%d", attrs.Name, attrs.Index, found, stp)
 
 		} else if attrs.MasterIndex > 0 {
-			loadNetlinkStates()
 			st, found := portByIndex[attrs.Index]
 			if found {
 				info.BridgePortState = st
