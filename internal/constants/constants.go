@@ -3,7 +3,7 @@ package constants
 import "time"
 
 const (
-	AppTitle                = "vxmon 0.1.2"
+	AppTitle                = "vxmon 0.1.3"
 	ClockTickInterval       = time.Second
 	AnimTickInterval        = 100 * time.Millisecond
 	NLMsgThrottleInterval   = 50 * time.Millisecond

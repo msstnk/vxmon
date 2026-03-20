@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/msstnk/vxmon/internal/constants"
+	"github.com/msstnk/vxmon/internal/helpers"
 	"github.com/msstnk/vxmon/internal/store"
 	"github.com/msstnk/vxmon/internal/types"
 	"github.com/msstnk/vxmon/internal/ui"
@@ -297,15 +298,18 @@ func bridgeVisibleChildRange(items []bridgeItem, cursor int, filterIdx int, visi
 	if bridge.Info.InterfaceName == "" {
 		return 0, 0
 	}
-	if mode != TopBridge || filterIdx < 0 || visibleTop <= 1 {
+	if mode != TopBridge || visibleTop <= 1 {
 		return 0, len(bridge.Devs)
 	}
-	if len(bridge.Devs) <= visibleTop-1 {
+	slots := visibleTop - 1
+	if len(bridge.Devs) <= slots {
 		return 0, len(bridge.Devs)
 	}
 
+	if filterIdx < 0 {
+		return 0, slots
+	}
 	selected := clamp(filterIdx, 0, len(bridge.Devs)-1)
-	slots := visibleTop - 1
 	start = selected - slots + 1
 	if start < 0 {
 		start = 0
@@ -313,6 +317,34 @@ func bridgeVisibleChildRange(items []bridgeItem, cursor int, filterIdx int, visi
 	end = start + slots
 	if end > len(bridge.Devs) {
 		end = len(bridge.Devs)
+		start = max(0, end-slots)
+	}
+	return start, end
+}
+
+func vrfVisibleChildRange(items []vrfItem, cursor int, filterIdx int, visibleTop int, mode TopMode) (start int, end int) {
+	if len(items) == 0 {
+		return 0, 0
+	}
+	vrf := pickVRF(items, cursor)
+	if mode != TopVRF || visibleTop <= 1 {
+		return 0, len(vrf.Devs)
+	}
+	slots := visibleTop - 1
+	if len(vrf.Devs) <= slots {
+		return 0, len(vrf.Devs)
+	}
+	if filterIdx < 0 {
+		return 0, slots
+	}
+	selected := clamp(filterIdx, 0, len(vrf.Devs)-1)
+	start = selected - slots + 1
+	if start < 0 {
+		start = 0
+	}
+	end = start + slots
+	if end > len(vrf.Devs) {
+		end = len(vrf.Devs)
 		start = max(0, end-slots)
 	}
 	return start, end
@@ -348,7 +380,7 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 				cols: []string{
 					b.Label,
 					b.Info.Status,
-					fmt.Sprintf("stp:%s", b.Info.STPState),
+					fmt.Sprintf("stp:%s", helpers.BridgeSTPStateLabel(b.Info.STPState)),
 					"",
 					b.Info.MACAddr,
 				},
@@ -377,7 +409,7 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 					cols: []string{
 						"  " + d.InterfaceName,
 						d.Status,
-						d.BridgePortState,
+						helpers.BridgePortStateLabel(d.BridgePortState),
 						vni,
 						d.MACAddr,
 					},
@@ -421,27 +453,27 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 		selected := pickVRF(vrfs, m.vrfCursor)
 		selectedDisplayDevs := selected.Devs
 		filterIf, filterOn := vrfIfFilter(selectedDisplayDevs, m.vrfDevFilterIdx, m.topMode)
-		idx := 0
-		parentRows := make([][]string, 0, len(vrfs))
-		parentStyles := make([]lipgloss.Style, 0, len(vrfs))
-		var childRows [][]string
-		var childStyles []lipgloss.Style
+		childStart, childEnd := vrfVisibleChildRange(vrfs, m.vrfCursor, m.vrfDevFilterIdx, visibleTop, m.topMode)
+		type displayRow struct {
+			cols  []string
+			style lipgloss.Style
+		}
+		displayRows := make([]displayRow, 0, len(vrfs))
+		cursorRenderedIndex = cur
 		for i, vrf := range vrfs {
-			displayDevs := selectedDisplayDevs
-			if i != cur {
-				displayDevs = vrf.Devs
-			}
+			displayDevs := vrf.Devs
 			cnt := len(displayDevs)
 			countText := fmt.Sprintf("(L3 devs: %d)", cnt)
 			if i == cur && filterOn {
 				countText += " (filtered)"
 			}
-			parentRows = append(parentRows, []string{vrf.Label, countText})
-			parentStyles = append(parentStyles, ui.FadeStyle(m.topParentMeta[vrfParentKey(vrf)], now, base))
-
+			displayRows = append(displayRows, displayRow{
+				cols:  []string{vrf.Label, countText},
+				style: ui.FadeStyle(m.topParentMeta[vrfParentKey(vrf)], now, base),
+			})
 			if i == cur {
-				cursorRenderedIndex = idx
-				for _, d := range displayDevs {
+				cursorRenderedIndex = len(displayRows) - 1
+				for _, d := range selectedDisplayDevs[childStart:childEnd] {
 					baseStyle := child
 					if filterOn {
 						if d.InterfaceName == filterIf {
@@ -451,32 +483,25 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 						}
 					}
 					st := ui.FadeStyle(m.topParentMeta[vrfChildKey(vrf, d)], now, baseStyle)
-					childRows = append(childRows, []string{
-						"  " + d.InterfaceName,
-						d.Status,
-						d.IfType,
-						d.MACAddr,
+					displayRows = append(displayRows, displayRow{
+						cols: []string{
+							"  " + d.InterfaceName,
+							d.Status,
+							d.IfType,
+							d.MACAddr,
+						},
+						style: st,
 					})
-					childStyles = append(childStyles, st)
 				}
 			}
-			idx = len(parentRows)
-			if i == cur {
-				idx += len(childRows)
-			}
 		}
-
-		parentLines := ui.FormatRows(parentRows, m.width-6)
-		childLines := ui.FormatRows(childRows, m.width-6)
-		childLineIdx := 0
-		for i := range parentLines {
-			rows = append(rows, ui.ListRow{Text: parentLines[i], Style: parentStyles[i]})
-			if i != cur {
-				continue
-			}
-			for ; childLineIdx < len(childLines); childLineIdx++ {
-				rows = append(rows, ui.ListRow{Text: childLines[childLineIdx], Style: childStyles[childLineIdx]})
-			}
+		tableRows := make([][]string, 0, len(displayRows))
+		for _, row := range displayRows {
+			tableRows = append(tableRows, row.cols)
+		}
+		lines := ui.FormatRows(tableRows, m.width-6)
+		for i, line := range lines {
+			rows = append(rows, ui.ListRow{Text: line, Style: displayRows[i].style})
 		}
 		if len(vrfs) == 0 {
 			cursorRenderedIndex = 0

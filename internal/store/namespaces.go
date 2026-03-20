@@ -21,6 +21,7 @@ type namespaceState struct {
 	info       types.NamespaceInfo
 	mountPoint string
 	handle     *netlink.Handle
+	nsHandle   netns.NsHandle
 }
 
 type discoveredNamespace struct {
@@ -257,8 +258,9 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 			state.info.ShortName = item.shortName
 			state.info.IsCurrent = item.isCurrent
 			if state.handle == nil {
-				handle, handleErr := newNamespaceHandle(item)
+				handle, nsHandle, handleErr := newNamespaceHandle(item)
 				state.handle = handle
+				state.nsHandle = nsHandle
 				state.info.PermissionErr = permissionText(handleErr)
 			} else {
 				state.info.PermissionErr = ""
@@ -283,12 +285,13 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 			IsCurrent:   item.isCurrent,
 		}
 
-		handle, handleErr := newNamespaceHandle(item)
+		handle, nsHandle, handleErr := newNamespaceHandle(item)
 		info.PermissionErr = permissionText(handleErr)
 		nextStates[item.namespaceID] = &namespaceState{
 			info:       info,
 			mountPoint: item.mountPoint,
 			handle:     handle,
+			nsHandle:   nsHandle,
 		}
 		nextList = append(nextList, info)
 	}
@@ -301,6 +304,9 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 		if state.handle != nil {
 			state.handle.Close()
 		}
+		if state.nsHandle.IsOpen() {
+			_ = state.nsHandle.Close()
+		}
 	}
 
 	s.namespacesByID = nextStates
@@ -309,18 +315,17 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 	return nil
 }
 
-func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, error) {
-	if item.isCurrent {
-		return netlink.NewHandleAt(netns.None())
-	}
-
+func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, netns.NsHandle, error) {
 	nsHandle, err := netns.GetFromPath(item.mountPoint)
 	if err != nil {
-		return nil, err
+		return nil, netns.None(), err
 	}
-	defer nsHandle.Close()
-
-	return netlink.NewHandleAt(nsHandle)
+	handle, err := netlink.NewHandleAt(nsHandle)
+	if err != nil {
+		_ = nsHandle.Close()
+		return nil, netns.None(), err
+	}
+	return handle, nsHandle, nil
 }
 
 func (s *Store) namespaceStates() []*namespaceState {

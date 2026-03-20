@@ -15,7 +15,7 @@
 ## Requirements
 - Linux
 - Go 1.26.0 or later
-- Access to netlink, `/proc`, and `/sys/class/net`
+- Access to netlink and `/proc`
 
 `vxmon` can run with limited permissions, but visibility may be partial. To inspect multiple namespaces, run it with sufficient privileges for your environment.
 
@@ -55,7 +55,7 @@ sudo docker run --rm \
 - Namespace discovery combines `nsfs` mount inspection with `/proc` scanning.
 - Route, neighbor, and link changes are consumed through netlink subscriptions.
 - Process and interface-rate data are refreshed periodically from `/proc`.
-- Bridge STP and bridge-port state are read from `/sys/class/net` when available.
+- Bridge STP and bridge-port states are retrieved via Netlink API across all namespaces.
 
 ## Limitations
 - Development is active and the tool may be unstable. Use with caution in production environments.

@@ -3,6 +3,7 @@ package helpers
 import (
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -75,5 +76,35 @@ func FormatNeighState(state int) string {
 		return "PERMANENT"
 	default:
 		return fmt.Sprintf("0x%02x", state)
+	}
+}
+
+func BridgeSTPStateLabel(n int) string {
+	if n < 0 {
+		return "-"
+	}
+	if n == 1 {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+func BridgePortStateLabel(n int) string {
+	if n < 0 {
+		return "-"
+	}
+	switch n {
+	case 0:
+		return "disabled"
+	case 1:
+		return "listening"
+	case 2:
+		return "learning"
+	case 3:
+		return "forwarding"
+	case 4:
+		return "blocking"
+	default:
+		return strconv.Itoa(n)
 	}
 }

@@ -26,8 +26,8 @@ type InterfaceInfo struct {
 	IfType           string
 	Status           string
 	OperState        string
-	STPState         string
-	BridgePortState  string
+	STPState         int
+	BridgePortState  int
 	TableID          uint32
 	VxlanID          int
 	VLANID           int

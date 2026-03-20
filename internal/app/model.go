@@ -513,18 +513,14 @@ func (m *Model) moveTopCursor(delta int) {
 	case TopBridge:
 		bridges := m.bridgeItems()
 		m.bridgeCursor = clamp(m.bridgeCursor+delta, 0, len(bridges)-1)
-		if delta != 0 {
-			m.bridgeDevFilterIdx = -1
-		}
+		m.bridgeDevFilterIdx = -1
 	case TopNETNS:
 		netnsItems := m.netnsItems()
 		m.netnsCursor = clamp(m.netnsCursor+delta, 0, len(netnsItems)-1)
 	default:
 		vrfs := m.vrfItems()
 		m.vrfCursor = clamp(m.vrfCursor+delta, 0, len(vrfs)-1)
-		if delta != 0 {
-			m.vrfDevFilterIdx = -1
-		}
+		m.vrfDevFilterIdx = -1
 	}
 	m.botCursor, m.botViewport = 0, 0
 }
@@ -799,13 +795,9 @@ func (m *Model) renderTopPane(visibleTop int) {
 		m.topPaneCache = ""
 		return
 	}
-	paneHeight := m.height - 1
 	topHeight, _ := m.paneHeights()
 	topTitle := fmt.Sprintf("  %s  ", strings.ToUpper(string(m.topMode)))
 	topContent := ui.RenderList(m.topRows, m.topCursorRowIdx, m.topViewport, visibleTop)
-	if paneHeight < 0 {
-		paneHeight = 0
-	}
 	m.topPaneCache = ui.RenderPane(topTitle, topContent, m.width, topHeight, m.focusTop)
 }
 
@@ -814,7 +806,6 @@ func (m *Model) renderBottomPane(visibleBottom int) {
 		m.bottomPaneCache = ""
 		return
 	}
-	paneHeight := m.height - 1
 	_, bottomHeight := m.paneHeights()
 	botTitle := fmt.Sprintf("  %s  ", strings.ToUpper(string(m.botMode)))
 	botContent := m.bottomHeaderStr
@@ -828,9 +819,6 @@ func (m *Model) renderBottomPane(visibleBottom int) {
 		} else {
 			botContent = botLines
 		}
-	}
-	if paneHeight < 0 {
-		paneHeight = 0
 	}
 	m.bottomPaneCache = ui.RenderPane(botTitle, botContent, m.width, bottomHeight, !m.focusTop)
 }
@@ -854,16 +842,38 @@ func (m *Model) adjustTopViewport(visibleTop int, data topItems) int {
 	}
 
 	viewport := clamp(m.topViewport, 0, max(0, len(m.topRows)-visibleTop))
-	selectedRow, hasChild := m.selectedTopSubFilterRenderedRow(data)
-	if !hasChild {
-		selectedRow = m.topCursorRowIdx
+	if m.topMode == TopBridge || m.topMode == TopVRF {
+		parentRow := m.topCursorRowIdx
+		totalChildren, shownChildren := m.selectedTopChildCount(data, visibleTop)
+		if shownChildren > 0 {
+			// When all children cannot fit in one screen, pin parent to the top and clip children.
+			if totalChildren > visibleTop-1 {
+				return clamp(parentRow, 0, max(0, len(m.topRows)-visibleTop))
+			}
+			// Keep current viewport if parent + shown children are already fully visible.
+			parentPos := parentRow - viewport
+			if parentPos >= 0 && parentPos < visibleTop {
+				rowsBelowParent := visibleTop - parentPos - 1
+				if shownChildren <= rowsBelowParent {
+					return viewport
+				}
+			}
+			// Otherwise move parent upward just enough so all shown children are visible.
+			maxParentPos := visibleTop - shownChildren - 1
+			if maxParentPos < 0 {
+				maxParentPos = 0
+			}
+			viewport = parentRow - maxParentPos
+			return clamp(viewport, 0, max(0, len(m.topRows)-visibleTop))
+		}
 	}
 
-	if m.topMode == TopBridge && hasChild {
+	if _, hasChild := m.selectedTopSubFilterRenderedRow(data); hasChild {
 		parentRow := m.topCursorRowIdx
 		return clamp(parentRow, 0, max(0, len(m.topRows)-visibleTop))
 	}
 
+	selectedRow := m.topCursorRowIdx
 	if selectedRow < viewport {
 		viewport = selectedRow
 	}
@@ -871,6 +881,29 @@ func (m *Model) adjustTopViewport(visibleTop int, data topItems) int {
 		viewport = selectedRow - visibleTop + 1
 	}
 	return clamp(viewport, 0, max(0, len(m.topRows)-visibleTop))
+}
+
+func (m *Model) selectedTopChildCount(data topItems, visibleTop int) (total int, shown int) {
+	switch m.topMode {
+	case TopBridge:
+		bridge := pickBridge(data.bridges, m.bridgeCursor)
+		if bridge.Info.InterfaceName == "" {
+			return 0, 0
+		}
+		total = len(bridge.Devs)
+		start, end := bridgeVisibleChildRange(data.bridges, m.bridgeCursor, m.bridgeDevFilterIdx, visibleTop, m.topMode)
+		return total, max(0, end-start)
+	case TopVRF:
+		vrf := pickVRF(data.vrfs, m.vrfCursor)
+		if vrf.Label == "" {
+			return 0, 0
+		}
+		total = len(vrf.Devs)
+		start, end := vrfVisibleChildRange(data.vrfs, m.vrfCursor, m.vrfDevFilterIdx, visibleTop, m.topMode)
+		return total, max(0, end-start)
+	default:
+		return 0, 0
+	}
 }
 
 func (m *Model) View() string {
@@ -935,7 +968,11 @@ func (m *Model) selectedVrfFilterRenderedRow(data topItems) (int, bool) {
 	if m.vrfDevFilterIdx >= len(displayDevs) {
 		return 0, false
 	}
-	return m.topCursorRowIdx + 1 + m.vrfDevFilterIdx, true
+	childStart, childEnd := vrfVisibleChildRange(data.vrfs, m.vrfCursor, m.vrfDevFilterIdx, m.topVisible, m.topMode)
+	if m.vrfDevFilterIdx < childStart || m.vrfDevFilterIdx >= childEnd {
+		return 0, false
+	}
+	return m.topCursorRowIdx + 1 + (m.vrfDevFilterIdx - childStart), true
 }
 
 func (m *Model) selectedBridgeFilterRenderedRow(data topItems) (int, bool) {
@@ -993,7 +1030,14 @@ func (m *Model) syncTopParentMeta(data topItems) {
 }
 
 func (m *Model) currentTopFadeKeys(data topItems) map[string]struct{} {
-	keys := make(map[string]struct{})
+	total := len(data.netns)
+	for _, item := range data.bridges {
+		total += 1 + len(item.Devs)
+	}
+	for _, item := range data.vrfs {
+		total += 1 + len(item.Devs)
+	}
+	keys := make(map[string]struct{}, total)
 	for _, item := range data.bridges {
 		keys[bridgeParentKey(item)] = struct{}{}
 		for _, dev := range item.Devs {

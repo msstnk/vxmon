@@ -305,7 +305,7 @@ func (s *Store) reloadNamespaceInterfaces(state *namespaceState) {
 		return
 	}
 
-	items, err := getInterfaceInfo(state.handle, state.info)
+	items, err := getInterfaceInfo(state.handle, state.info, int(state.nsHandle))
 	if err != nil {
 		debuglog.Errorf("store.reloadNamespaceInterfaces namespace=%d failed: %v", state.info.ID, err)
 		return

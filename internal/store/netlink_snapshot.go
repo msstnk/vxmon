@@ -3,21 +3,19 @@ package store
 import (
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
+	"github.com/msstnk/vxmon/internal/debuglog"
 	"github.com/msstnk/vxmon/internal/types"
 )
 
-// netlink_snapshot.go reads kernel and sysfs state to build typed snapshots.
+// netlink_snapshot.go reads kernel state to build typed snapshots.
 
-func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo) ([]types.InterfaceInfo, error) {
+func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) ([]types.InterfaceInfo, error) {
 	links, err := h.LinkList()
 	if err != nil {
 		return nil, fmt.Errorf("LinkList failed: %v", err)
@@ -36,6 +34,17 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo) ([]types.Interf
 		}
 	}
 
+	var stpByIndex map[int]int
+	var portByIndex map[int]int
+	netlinkStatesLoaded := false
+	loadNetlinkStates := func() {
+		if netlinkStatesLoaded {
+			return
+		}
+		stpByIndex, portByIndex = loadBridgeNetlinkStates(ns, nsHandle)
+		netlinkStatesLoaded = true
+	}
+
 	results := make([]types.InterfaceInfo, 0, len(links))
 	for _, link := range links {
 		attrs := link.Attrs()
@@ -51,6 +60,8 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo) ([]types.Interf
 			ParentID:         attrs.ParentIndex,
 			MasterID:         attrs.MasterIndex,
 			MACAddr:          attrs.HardwareAddr.String(),
+			STPState:         -1,
+			BridgePortState:  -1,
 		}
 
 		info.Status = "down"
@@ -77,9 +88,20 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo) ([]types.Interf
 			}
 		}
 		if linkType == "bridge" {
-			info.STPState = bridgeSTPState(ns, attrs.Name)
+			loadNetlinkStates()
+			stp, found := stpByIndex[attrs.Index]
+			if found {
+				info.STPState = stp
+			}
+			debuglog.Tracef("store.bridgeSTPState netlink if=%s index=%d found=%t val=%d", attrs.Name, attrs.Index, found, stp)
+
 		} else if attrs.MasterIndex > 0 {
-			info.BridgePortState = bridgePortState(ns, attrs.Name)
+			loadNetlinkStates()
+			st, found := portByIndex[attrs.Index]
+			if found {
+				info.BridgePortState = st
+			}
+			debuglog.Tracef("store.bridgePortState netlink if=%s index=%d master=%d found=%t val=%d", attrs.Name, attrs.Index, attrs.MasterIndex, found, st)
 		}
 		if info.TableID == 0 && attrs.Slave != nil && attrs.Slave.SlaveType() == "vrf" {
 			if vrfSlave, ok := attrs.Slave.(*netlink.VrfSlave); ok {
@@ -98,58 +120,6 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo) ([]types.Interf
 		return results[i].InterfaceID < results[j].InterfaceID
 	})
 	return results, nil
-}
-
-func bridgeSTPState(ns types.NamespaceInfo, ifName string) string {
-	if !ns.IsRoot {
-		return "-"
-	}
-	path := filepath.Join("/sys/class/net", ifName, "bridge", "stp_state")
-	n, ok := readSysfsInt(path)
-	if !ok {
-		return "-"
-	}
-	if n == 1 {
-		return "enabled"
-	}
-	return "disabled"
-}
-
-func bridgePortState(ns types.NamespaceInfo, ifName string) string {
-	if !ns.IsRoot {
-		return "-"
-	}
-	path := filepath.Join("/sys/class/net", ifName, "brport", "state")
-	n, ok := readSysfsInt(path)
-	if !ok {
-		return "-"
-	}
-	switch n {
-	case 0:
-		return "disabled"
-	case 1:
-		return "listening"
-	case 2:
-		return "learning"
-	case 3:
-		return "forwarding"
-	case 4:
-		return "blocking"
-	default:
-		return strconv.Itoa(n)
-	}
-}
-
-func readSysfsInt(path string) (int, bool) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		return 0, false
-	}
-	return n, true
 }
 
 func getFdbList(h *netlink.Handle, ns types.NamespaceInfo) ([]types.FdbEntry, error) {

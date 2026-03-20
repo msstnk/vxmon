@@ -1,5 +1,7 @@
 package app
 
+import "slices"
+
 func bottomModesForTop(mode TopMode) []BottomMode {
 	switch mode {
 	case TopVRF:
@@ -12,12 +14,7 @@ func bottomModesForTop(mode TopMode) []BottomMode {
 }
 
 func isBottomModeAllowed(topMode TopMode, bottomMode BottomMode) bool {
-	for _, mode := range bottomModesForTop(topMode) {
-		if mode == bottomMode {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(bottomModesForTop(topMode), bottomMode)
 }
 
 func (m *Model) rememberBottomMode() {
