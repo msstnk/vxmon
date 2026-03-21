@@ -1,12 +1,15 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
+	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 
 	"github.com/msstnk/vxmon/internal/debuglog"
@@ -14,13 +17,12 @@ import (
 )
 
 // netlink_snapshot.go reads kernel state to build typed snapshots.
-
 func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) ([]types.InterfaceInfo, error) {
-	links, err := h.LinkList()
+	links, stpByIndex, portByIndex, err := getLinksAndBridgeStates(ns, nsHandle)
 	if err != nil {
-		return nil, fmt.Errorf("LinkList failed: %v", err)
+		return nil, fmt.Errorf("getLinksAndBridgeStates failed: %v", err)
 	}
-	stpByIndex, portByIndex := loadBridgeNetlinkStates(ns, nsHandle)
+
 	indexToName := make(map[int]string, len(links))
 	for _, link := range links {
 		indexToName[link.Attrs().Index] = link.Attrs().Name
@@ -81,14 +83,11 @@ func getInterfaceInfo(h *netlink.Handle, ns types.NamespaceInfo, nsHandle int) (
 			if found {
 				info.STPState = stp
 			}
-			debuglog.Tracef("store.bridgeSTPState netlink if=%s index=%d found=%t val=%d", attrs.Name, attrs.Index, found, stp)
-
 		} else if attrs.MasterIndex > 0 {
 			st, found := portByIndex[attrs.Index]
 			if found {
 				info.BridgePortState = st
 			}
-			debuglog.Tracef("store.bridgePortState netlink if=%s index=%d master=%d found=%t val=%d", attrs.Name, attrs.Index, attrs.MasterIndex, found, st)
 		}
 		if info.TableID == 0 && attrs.Slave != nil && attrs.Slave.SlaveType() == "vrf" {
 			if vrfSlave, ok := attrs.Slave.(*netlink.VrfSlave); ok {
@@ -307,4 +306,118 @@ func routeIPString(ip net.IP) string {
 		return ""
 	}
 	return ip.String()
+}
+
+func getLinksAndBridgeStates(ns types.NamespaceInfo, nsHandle int) ([]netlink.Link, map[int]int, map[int]int, error) {
+	stpByIndex := map[int]int{}
+	portByIndex := map[int]int{}
+	var links []netlink.Link
+
+	var sh *nl.SocketHandle
+	if ns.IsCurrent {
+		sock, err := nl.Subscribe(unix.NETLINK_ROUTE)
+		if err != nil {
+			debuglog.Tracef("store.getLinksAndBridgeStates nl.Subscribe failed: %v", err)
+			return nil, nil, nil, err
+		}
+		sh = &nl.SocketHandle{Socket: sock}
+	} else {
+		sock, err := nl.GetNetlinkSocketAt(netns.NsHandle(nsHandle), netns.None(), unix.NETLINK_ROUTE)
+		if err != nil {
+			debuglog.Tracef("store.getLinksAndBridgeStates nl.GetNetlinkSocketAt failed: %v", err)
+			return nil, nil, nil, err
+		}
+		sh = &nl.SocketHandle{Socket: sock}
+	}
+	defer sh.Close()
+
+	dump := func(family uint8) error {
+		req := nl.NewNetlinkRequest(unix.RTM_GETLINK, unix.NLM_F_DUMP)
+		req.Sockets = map[int]*nl.SocketHandle{unix.NETLINK_ROUTE: sh}
+		req.AddData(nl.NewIfInfomsg(int(family)))
+
+		msgs, err := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWLINK)
+		if err != nil && !errors.Is(err, netlink.ErrDumpInterrupted) {
+			debuglog.Tracef("store.getLinksAndBridgeStates Execute failed for family=%d: %v", family, err)
+			return err
+		}
+
+		for _, m := range msgs {
+			if family == unix.AF_UNSPEC {
+				if link, err := netlink.LinkDeserialize(nil, m); err == nil && link != nil {
+					links = append(links, link)
+				}
+			}
+
+			ans := nl.DeserializeIfInfomsg(m)
+			attrs, err := nl.ParseRouteAttrAsMap(m[ans.Len():])
+			if err != nil {
+				continue
+			}
+
+			index := int(ans.Index)
+			if attr, ok := attrs[unix.IFLA_LINKINFO]; ok {
+				if stp, ok := parseBridgeStpState(attr.Value); ok {
+					stpByIndex[index] = stp
+				}
+			}
+
+			protKey := uint16(unix.IFLA_PROTINFO | unix.NLA_F_NESTED)
+			if attr, ok := attrs[protKey]; ok {
+				if port, ok := parseBridgePortState(attr.Value); ok {
+					portByIndex[index] = port
+				}
+			}
+		}
+		return nil
+	}
+
+	if err := dump(unix.AF_UNSPEC); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if len(portByIndex) == 0 {
+		_ = dump(unix.AF_BRIDGE)
+	}
+
+	return links, stpByIndex, portByIndex, nil
+}
+
+func parseBridgeStpState(b []byte) (int, bool) {
+	attrs, err := nl.ParseRouteAttrAsMap(b)
+	if err != nil || attrs == nil {
+		debuglog.Tracef("store.parseBridgeStpState ParseRouteAttrAsMap failed: %v", err)
+		return 0, false
+	}
+	// IFLA_INFO_DATA -> IFLA_BR_STP_STATE
+	if infoAttr, ok := attrs[unix.IFLA_INFO_DATA]; ok {
+		infoItems, _ := nl.ParseRouteAttrAsMap(infoAttr.Value)
+		if item, ok := infoItems[nl.IFLA_BR_STP_STATE]; ok {
+			return decodeInt(item.Value)
+		}
+	}
+	return 0, false
+}
+
+func parseBridgePortState(b []byte) (int, bool) {
+	attrs, err := nl.ParseRouteAttrAsMap(b)
+	if err != nil || attrs == nil {
+		debuglog.Tracef("store.parseBridgePortState ParseRouteAttrAsMap failed: %v", err)
+		return 0, false
+	}
+	// IFLA_BRPORT_STATE
+	if attr, ok := attrs[nl.IFLA_BRPORT_STATE]; ok {
+		return decodeInt(attr.Value)
+	}
+	return 0, false
+}
+
+func decodeInt(b []byte) (int, bool) {
+	if len(b) >= 4 {
+		return int(nl.NativeEndian().Uint32(b[:4])), true
+	}
+	if len(b) >= 1 {
+		return int(b[0]), true
+	}
+	return 0, false
 }
