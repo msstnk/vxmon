@@ -12,18 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/msstnk/vxmon/internal/debuglog"
 	"github.com/msstnk/vxmon/internal/types"
 )
 
 type processSample struct {
 	cpuTicks uint64
-}
-
-type linkSample struct {
-	rxBytes uint64
-	txBytes uint64
-	at      time.Time
 }
 
 type rawProcess struct {
@@ -53,7 +46,6 @@ func (s *Store) reloadRuntime(now time.Time) error {
 	}
 
 	s.reloadProcesses(now, scan)
-	s.reloadAllLinks(now)
 	s.lastRuntime = now
 	return nil
 }
@@ -132,83 +124,8 @@ func (s *Store) reloadProcesses(now time.Time, scan procScanResult) {
 	for _, rows := range nextProcRows {
 		flat = append(flat, rows...)
 	}
-	s.processRecords, s.processMeta = reconcile(s.processRecords, s.processMeta, flat, processKey, processFingerprint, now)
-}
 
-func (s *Store) reloadAllLinks(now time.Time) {
-	nextLinks := make(map[uint64][]types.NamespaceLinkInfo, len(s.namespaces))
-	for _, state := range s.namespaceStates() {
-		rows := s.snapshotNamespaceLinks(state, now)
-		nextLinks[state.info.ID] = rows
-		s.linkRecords, s.linkMeta = reconcileNamespace(s.linkRecords, s.linkMeta, rows, linkKey, linkFingerprint, state.info.ID, now)
-	}
-	s.links = nextLinks
-}
-
-func (s *Store) reloadNamespaceLinks(state *namespaceState, now time.Time) {
-	if state == nil {
-		return
-	}
-	rows := s.snapshotNamespaceLinks(state, now)
-	s.links[state.info.ID] = rows
-	s.linkRecords, s.linkMeta = reconcileNamespace(s.linkRecords, s.linkMeta, rows, linkKey, linkFingerprint, state.info.ID, now)
-}
-
-func (s *Store) snapshotNamespaceLinks(state *namespaceState, now time.Time) []types.NamespaceLinkInfo {
-	if state.handle == nil {
-		return nil
-	}
-
-	links, err := state.handle.LinkList()
-	if err != nil {
-		debuglog.Errorf("store.snapshotNamespaceLinks namespace=%d failed: %v", state.info.ID, err)
-		return nil
-	}
-
-	rows := make([]types.NamespaceLinkInfo, 0, len(links))
-	for _, link := range links {
-		attrs := link.Attrs()
-		if attrs.Statistics == nil {
-			continue
-		}
-
-		key := linkSampleKey(state.info.ID, attrs.Index)
-		prev := s.linkPrev[key]
-		rxBps := uint64(0)
-		txBps := uint64(0)
-		if !prev.at.IsZero() {
-			elapsed := now.Sub(prev.at).Seconds()
-			if elapsed > 0 {
-				if attrs.Statistics.RxBytes >= prev.rxBytes {
-					rxBps = uint64(float64(attrs.Statistics.RxBytes-prev.rxBytes) * 8.0 / elapsed)
-				}
-				if attrs.Statistics.TxBytes >= prev.txBytes {
-					txBps = uint64(float64(attrs.Statistics.TxBytes-prev.txBytes) * 8.0 / elapsed)
-				}
-			}
-		}
-
-		rows = append(rows, types.NamespaceLinkInfo{
-			NamespaceID: state.info.ID,
-			InterfaceID: attrs.Index,
-			Name:        attrs.Name,
-			Type:        link.Type(),
-			RxBps:       rxBps,
-			TxBps:       txBps,
-			RxErrors:    attrs.Statistics.RxErrors,
-			TxErrors:    attrs.Statistics.TxErrors,
-		})
-		s.linkPrev[key] = linkSample{
-			rxBytes: attrs.Statistics.RxBytes,
-			txBytes: attrs.Statistics.TxBytes,
-			at:      now,
-		}
-	}
-
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].InterfaceID < rows[j].InterfaceID
-	})
-	return rows
+	s.processRecords, s.processMeta, _ = reconcile(s.processRecords, s.processMeta, flat, processKey, processFingerprint, now)
 }
 
 func scanProcfs(includeProcessDetails bool) procScanResult {
@@ -440,8 +357,4 @@ func readTotalCPUTime() uint64 {
 
 func processSampleKey(nsID uint64, pid int) string {
 	return strconv.FormatUint(nsID, 10) + "|" + strconv.Itoa(pid)
-}
-
-func linkSampleKey(nsID uint64, ifIndex int) string {
-	return strconv.FormatUint(nsID, 10) + "|" + strconv.Itoa(ifIndex)
 }

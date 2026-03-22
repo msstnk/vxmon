@@ -379,7 +379,7 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 			displayRows = append(displayRows, displayRow{
 				cols: []string{
 					b.Label,
-					b.Info.Status,
+					fmt.Sprintf("%s/%s", b.Info.Status, b.Info.OperState),
 					fmt.Sprintf("stp:%s", helpers.BridgeSTPStateLabel(b.Info.STPState)),
 					"",
 					b.Info.MACAddr,
@@ -408,7 +408,7 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 				displayRows = append(displayRows, displayRow{
 					cols: []string{
 						"  " + d.InterfaceName,
-						d.Status,
+						fmt.Sprintf("%s/%s", d.Status, d.OperState),
 						helpers.BridgePortStateLabel(d.BridgePortState),
 						vni,
 						d.MACAddr,
@@ -486,7 +486,7 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 					displayRows = append(displayRows, displayRow{
 						cols: []string{
 							"  " + d.InterfaceName,
-							d.Status,
+							fmt.Sprintf("%s/%s", d.Status, d.OperState),
 							d.IfType,
 							d.MACAddr,
 						},

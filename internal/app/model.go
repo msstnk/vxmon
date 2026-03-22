@@ -35,7 +35,8 @@ var topModeCycle = []TopMode{TopBridge, TopVRF, TopNETNS}
 
 // Model is created in cmd/vxmon/main and then owned by Bubble Tea's single update loop.
 type Model struct {
-	st *store.Store
+	st                 *store.Store
+	requestFetchLatest func(time.Time)
 
 	focusTop bool
 	topMode  TopMode
@@ -79,33 +80,24 @@ type Model struct {
 
 	topParentMeta  map[string]store.Meta
 	topParentReady bool
-
-	nsReloadRefreshedAt map[uint64]time.Time
-	nsReloadDirty       map[uint64]nlReloadMask
-	nsReloadDueAt       map[uint64]time.Time
-	nsReloadPending     map[uint64]bool
 }
 
-func NewModel(st *store.Store) Model {
+func NewModel(st *store.Store, requestFetchLatest func(time.Time)) Model {
 	now := time.Now()
 	m := Model{
-		st:                  st,
-		focusTop:            true,
-		topMode:             TopVRF,
-		botMode:             BottomRoute,
-		clock:               now,
-		fadeClock:           now,
-		bridgeDevFilterIdx:  -1,
-		vrfDevFilterIdx:     -1,
-		topPanePercent:      constants.DefaultTopPanePercent,
-		savedBottomModes:    make(map[TopMode]BottomMode, len(topModeCycle)),
-		topParentMeta:       make(map[string]store.Meta),
-		nsReloadRefreshedAt: make(map[uint64]time.Time),
-		nsReloadDirty:       make(map[uint64]nlReloadMask),
-		nsReloadDueAt:       make(map[uint64]time.Time),
-		nsReloadPending:     make(map[uint64]bool),
+		st:                 st,
+		requestFetchLatest: requestFetchLatest,
+		focusTop:           true,
+		topMode:            TopVRF,
+		botMode:            BottomRoute,
+		clock:              now,
+		fadeClock:          now,
+		bridgeDevFilterIdx: -1,
+		vrfDevFilterIdx:    -1,
+		topPanePercent:     constants.DefaultTopPanePercent,
+		savedBottomModes:   make(map[TopMode]BottomMode, len(topModeCycle)),
+		topParentMeta:      make(map[string]store.Meta),
 	}
-	_ = st.ReloadAll(now)
 	m.refreshAll()
 	m.fadeTickActive = st.HasActiveFades() || m.hasActiveTopParentFades()
 	return m
@@ -113,6 +105,7 @@ func NewModel(st *store.Store) Model {
 
 func (m *Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{clockTickCmd()}
+	cmds = append(cmds, m.requestFetchLatestCmd(time.Now()))
 	if m.fadeTickActive {
 		cmds = append(cmds, animTickCmd())
 	}
@@ -141,6 +134,16 @@ func batchCmds(cmds ...tea.Cmd) tea.Cmd {
 		return filtered[0]
 	default:
 		return tea.Batch(filtered...)
+	}
+}
+
+func (m *Model) requestFetchLatestCmd(at time.Time) tea.Cmd {
+	if m.requestFetchLatest == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		m.requestFetchLatest(at)
+		return nil
 	}
 }
 
@@ -179,20 +182,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case animTickMsg:
 		now := time.Time(x)
 		m.fadeClock = now
-		changed, active := m.st.Advance(now)
 		topChanged, topActive := m.advanceTopParentFades(now)
-		if changed || active || topChanged || topActive {
+		storeActive := m.st.HasActiveFades()
+		if storeActive || topChanged || topActive {
 			if m.showHelp {
 				m.helpDirty = true
 			} else {
 				if topChanged || topActive {
 					m.refreshTopAndBottom()
 				} else {
-					m.refreshBottomOnly()
+					m.rerenderBottomOnly()
 				}
 			}
 		}
-		if active || topActive {
+		if storeActive || topActive {
 			m.fadeTickActive = true
 			return m, animTickCmd()
 		}
@@ -202,83 +205,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clockTickMsg:
 		now := time.Time(x)
 		m.clock = now
-		runtimeRefreshed := false
+		var cmd tea.Cmd
 		if m.st.RuntimeRefreshDue(now) {
-			_ = m.st.ReloadRuntime(now)
-			runtimeRefreshed = true
+			cmd = m.requestFetchLatestCmd(now)
 		}
 		if m.showHelp {
 			m.helpDirty = true
 		} else {
-			if runtimeRefreshed {
-				m.refreshHeaderOnly()
-				m.refreshTopAndBottom()
-			} else {
-				m.refreshHeaderOnly()
-			}
+			m.refreshHeaderOnly()
 		}
-		if runtimeRefreshed {
-			return m, batchCmds(clockTickCmd(), m.maybeStartFadeTick())
-		}
-		return m, clockTickCmd()
+		return m, batchCmds(clockTickCmd(), cmd)
 
-	case store.NamespaceSyncMsg:
-		_ = m.st.ReloadAll(x.At)
-		if m.showHelp {
-			m.helpDirty = true
-		} else {
-			m.refreshAll()
-		}
-		return m, m.maybeStartFadeTick()
-
-	case store.NeighNLMsg:
-		cmds := make([]tea.Cmd, 0, 2)
-		cmd := m.scheduleNamespaceReload(nlReloadNeighAndFDB, x.Namespace.ID, x.At)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		cmd = m.scheduleNamespaceReload(nlReloadInterfaces, x.Namespace.ID, x.At)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		return m, batchCmds(cmds...)
-
-	case store.RouteNLMsg:
-		cmds := make([]tea.Cmd, 0, 2)
-		cmd := m.scheduleNamespaceReload(nlReloadRoutes, x.Namespace.ID, x.At)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		cmd = m.scheduleNamespaceReload(nlReloadInterfaces, x.Namespace.ID, x.At)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		return m, batchCmds(cmds...)
-
-	case store.LinkNLMsg:
-		cmds := make([]tea.Cmd, 0, 2)
-		cmd := m.scheduleNamespaceReload(nlReloadInterfaces, x.Namespace.ID, x.At)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		cmd = m.scheduleNamespaceReload(nlReloadLinks, x.Namespace.ID, x.At)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		return m, batchCmds(cmds...)
-
-	case nlReloadTickMsg:
-		reloaded, cmd := m.runScheduledNamespaceReload(x)
-		if !reloaded {
-			return m, cmd
-		}
+	case store.InventoryUpdatedMsg:
 		if m.showHelp {
 			m.helpDirty = true
 		} else {
 			m.refreshTopAndBottom()
 		}
-		return m, batchCmds(cmd, m.maybeStartFadeTick())
-
+		return m, m.maybeStartFadeTick()
+	case store.InventoryPeriodicUpdatedMsg:
+		if m.showHelp {
+			m.helpDirty = true
+		} else if m.topMode == TopNETNS {
+			m.refreshTopAndBottom()
+		}
+		return m, m.maybeStartFadeTick()
 	case tea.MouseMsg:
 		if m.showHelp {
 			return m, nil
@@ -396,7 +347,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.moveTopPage(delta, visibleTop)
 				topDataChanged = true
 			} else {
-				m.moveBottomPage(delta, visibleBottom)
+				m.botCursor += delta * visibleBottom
 				if !topDataChanged {
 					bottomRenderChanged = true
 				}
@@ -561,15 +512,17 @@ func (m *Model) moveTopBoundary(last bool) {
 	}
 	m.botCursor, m.botViewport = 0, 0
 }
-
+func (m *Model) moveBottomCursor(delta int) {
+	items := m.bottomRows
+	maxIdx := min(len(items)-1, 0)
+	m.botCursor = clamp(m.botCursor+delta, 0, maxIdx)
+}
 func (m *Model) moveBottomPage(delta int, visibleBottom int) {
 	step := visibleBottom
 	if step < 1 {
 		step = 1
 	}
-	move := delta * step
-	m.botCursor += move
-	m.botViewport += move
+	m.moveBottomCursor(delta * step)
 }
 
 func (m *Model) moveBottomBoundary(last bool, visibleBottom int) {
@@ -632,124 +585,6 @@ func (m *Model) refreshTopAndBottom() {
 	m.renderTopPane(visibleTop)
 	m.renderBottomPane(visibleBottom)
 	m.rebuildBaseCache()
-}
-
-func (m *Model) scheduleNamespaceReload(kind nlReloadKind, namespaceID uint64, at time.Time) tea.Cmd {
-	m.namespaceReloadAddDirty(namespaceID, kind)
-	dueAt := at.Add(constants.NLMsgThrottleInterval)
-	last := m.namespaceReloadRefreshedAt(namespaceID)
-	if !last.IsZero() {
-		minDueAt := last.Add(constants.NLMsgThrottleInterval)
-		if minDueAt.After(dueAt) {
-			dueAt = minDueAt
-		}
-	}
-	m.namespaceReloadSetDueAt(namespaceID, dueAt)
-	if m.namespaceReloadPending(namespaceID) {
-		return nil
-	}
-
-	m.namespaceReloadSetPending(namespaceID, true)
-	return tea.Tick(time.Until(dueAt), func(t time.Time) tea.Msg {
-		return nlReloadTickMsg{NamespaceID: namespaceID, At: t}
-	})
-}
-
-func (m *Model) runScheduledNamespaceReload(msg nlReloadTickMsg) (bool, tea.Cmd) {
-	namespaceID := msg.NamespaceID
-	if !m.namespaceReloadPending(namespaceID) {
-		return false, nil
-	}
-	dueAt := m.namespaceReloadDueAt(namespaceID)
-	at := msg.At
-	if at.IsZero() {
-		at = time.Now()
-	}
-	if dueAt.After(at) {
-		return false, tea.Tick(time.Until(dueAt), func(t time.Time) tea.Msg {
-			return nlReloadTickMsg{NamespaceID: namespaceID, At: t}
-		})
-	}
-	m.namespaceReloadSetPending(namespaceID, false)
-	dirty := m.namespaceReloadTakeDirty(namespaceID)
-	if dirty == 0 {
-		m.namespaceReloadClearDueAt(namespaceID)
-		return false, nil
-	}
-	m.namespaceReloadClearDueAt(namespaceID)
-	if dirty&nlReloadMaskForKind(nlReloadInterfaces) != 0 {
-		m.applyNamespaceReload(nlReloadInterfaces, namespaceID, at)
-	}
-	if dirty&nlReloadMaskForKind(nlReloadNeighAndFDB) != 0 {
-		m.applyNamespaceReload(nlReloadNeighAndFDB, namespaceID, at)
-	}
-	if dirty&nlReloadMaskForKind(nlReloadRoutes) != 0 {
-		m.applyNamespaceReload(nlReloadRoutes, namespaceID, at)
-	}
-	if dirty&nlReloadMaskForKind(nlReloadLinks) != 0 {
-		m.applyNamespaceReload(nlReloadLinks, namespaceID, at)
-	}
-	m.namespaceReloadSetRefreshedAt(namespaceID, at)
-	return true, nil
-}
-
-func (m *Model) applyNamespaceReload(kind nlReloadKind, namespaceID uint64, at time.Time) {
-	switch kind {
-	case nlReloadNeighAndFDB:
-		_ = m.st.ReloadNamespaceNeighAndFDB(namespaceID, at)
-	case nlReloadRoutes:
-		_ = m.st.ReloadNamespaceRoutes(namespaceID, at)
-	case nlReloadLinks:
-		_ = m.st.ReloadNamespaceLinks(namespaceID, at)
-	default:
-		_ = m.st.ReloadNamespaceInterfaces(namespaceID)
-	}
-}
-
-func nlReloadMaskForKind(kind nlReloadKind) nlReloadMask {
-	return 1 << kind
-}
-
-func (m *Model) namespaceReloadRefreshedAt(namespaceID uint64) time.Time {
-	return m.nsReloadRefreshedAt[namespaceID]
-}
-
-func (m *Model) namespaceReloadSetRefreshedAt(namespaceID uint64, at time.Time) {
-	m.nsReloadRefreshedAt[namespaceID] = at
-}
-
-func (m *Model) namespaceReloadPending(namespaceID uint64) bool {
-	return m.nsReloadPending[namespaceID]
-}
-
-func (m *Model) namespaceReloadDueAt(namespaceID uint64) time.Time {
-	return m.nsReloadDueAt[namespaceID]
-}
-
-func (m *Model) namespaceReloadSetPending(namespaceID uint64, pending bool) {
-	if pending {
-		m.nsReloadPending[namespaceID] = true
-		return
-	}
-	delete(m.nsReloadPending, namespaceID)
-}
-
-func (m *Model) namespaceReloadSetDueAt(namespaceID uint64, at time.Time) {
-	m.nsReloadDueAt[namespaceID] = at
-}
-
-func (m *Model) namespaceReloadClearDueAt(namespaceID uint64) {
-	delete(m.nsReloadDueAt, namespaceID)
-}
-
-func (m *Model) namespaceReloadAddDirty(namespaceID uint64, kind nlReloadKind) {
-	m.nsReloadDirty[namespaceID] |= nlReloadMaskForKind(kind)
-}
-
-func (m *Model) namespaceReloadTakeDirty(namespaceID uint64) nlReloadMask {
-	dirty := m.nsReloadDirty[namespaceID]
-	delete(m.nsReloadDirty, namespaceID)
-	return dirty
 }
 
 func (m *Model) refreshBottomOnly() {

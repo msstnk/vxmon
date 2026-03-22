@@ -44,7 +44,7 @@ func processKey(p types.ProcessInfo) string {
 }
 
 func processFingerprint(p types.ProcessInfo) string {
-	return p.Exe + "|" + p.User
+	return p.Exe + "|" + strconv.Itoa(p.PID)
 }
 
 func linkKey(l types.NamespaceLinkInfo) string {

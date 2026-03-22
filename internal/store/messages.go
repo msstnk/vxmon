@@ -36,3 +36,11 @@ type LinkNLMsg struct {
 type NamespaceSyncMsg struct {
 	At time.Time
 }
+
+// InventoryUpdatedMsg is emitted by the store loop after a full update cycle is applied.
+type InventoryUpdatedMsg struct {
+	At time.Time
+}
+type InventoryPeriodicUpdatedMsg struct {
+	At time.Time
+}

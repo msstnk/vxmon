@@ -42,23 +42,12 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 		}
 	}
 
-	// Identify root Namespace
 	rootID, err := readNamespaceID("/proc/1/ns/net")
-	if err != nil && (os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
-		rootID = selfNamespaceID
-	} else if err != nil {
-		return nil, err
-	}
-
-	if rootID != selfNamespaceID {
-		if rootHandle, err := netns.GetFromPath("/proc/1/ns/net"); err != nil {
-			if os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-				rootID = selfNamespaceID
-			} else {
-				return nil, err
-			}
+	if err != nil {
+		if os.IsPermission(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			rootID = selfNamespaceID
 		} else {
-			rootHandle.Close()
+			return nil, err
 		}
 	}
 
@@ -67,9 +56,51 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 		procScan = &scan
 	}
 
-	byID := make(map[uint64]discoveredNamespace, 8)
+	byID := make(map[uint64]discoveredNamespace)
 
-	// Initial registration of Root and Self
+	if file, err := os.Open("/proc/self/mountinfo"); err == nil {
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			sepIdx := -1
+			for i, f := range fields {
+				if f == "-" {
+					sepIdx = i
+					break
+				}
+			}
+			if sepIdx == -1 || len(fields) <= sepIdx+1 || fields[sepIdx+1] != "nsfs" {
+				continue
+			}
+
+			if nsID, ok := parseNamespaceToken(fields[3]); ok {
+				path := fields[4]
+				byID[nsID] = discoveredNamespace{
+					namespaceID: nsID,
+					mountPoint:  path,
+					displayName: path,
+					shortName:   filepath.Base(path),
+					isCurrent:   nsID == selfNamespaceID,
+					sortKey:     path,
+				}
+			}
+		}
+		file.Close()
+	}
+
+	for nsID, ref := range procScan.namespaces {
+		if _, exists := byID[nsID]; !exists {
+			byID[nsID] = discoveredNamespace{
+				namespaceID: nsID,
+				mountPoint:  ref.path,
+				displayName: ref.path,
+				shortName:   ref.path,
+				isCurrent:   nsID == selfNamespaceID,
+				sortKey:     ref.path,
+			}
+		}
+	}
+
 	byID[rootID] = discoveredNamespace{
 		namespaceID: rootID,
 		mountPoint:  "/proc/1/ns/net",
@@ -78,7 +109,8 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 		isRoot:      true,
 		isCurrent:   rootID == selfNamespaceID,
 	}
-	if rootID != selfNamespaceID {
+
+	if selfNamespaceID != rootID {
 		byID[selfNamespaceID] = discoveredNamespace{
 			namespaceID: selfNamespaceID,
 			mountPoint:  "/proc/self/ns/net",
@@ -88,84 +120,12 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 			sortKey:     "/proc/self/ns/net",
 		}
 	} else {
-		// If root == self, overwrite the path
 		item := byID[rootID]
 		item.mountPoint = "/proc/self/ns/net"
 		item.displayName = "/proc/self/ns/net"
 		byID[rootID] = item
 	}
 
-	// Extract nsfs from mountinfo
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-
-		// Look for the separator "-" and check if the token immediately after it is "nsfs"
-		sepIdx := -1
-		for i, f := range fields {
-			if f == "-" {
-				sepIdx = i
-				break
-			}
-		}
-		if sepIdx == -1 || len(fields) <= sepIdx+1 || fields[sepIdx+1] != "nsfs" {
-			continue
-		}
-
-		// For nsfs, fields[3] is the root (token containing nsID), fields[4] is the mountPoint
-		nsID, ok := parseNamespaceToken(fields[3])
-		if !ok {
-			continue
-		}
-
-		if existing, exists := byID[nsID]; exists && existing.isRoot {
-			continue
-		}
-
-		mountPoint := fields[4]
-		shortName := filepath.Base(mountPoint)
-		if shortName == "." || shortName == "/" || shortName == "" {
-			shortName = mountPoint
-		}
-
-		byID[nsID] = discoveredNamespace{
-			namespaceID: nsID,
-			mountPoint:  mountPoint,
-			displayName: mountPoint,
-			shortName:   shortName,
-			isCurrent:   nsID == selfNamespaceID,
-			sortKey:     mountPoint,
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	// Merge procScan results
-	for nsID, ref := range procScan.namespaces {
-		if existing, exists := byID[nsID]; exists {
-			if existing.isRoot || !isProcNamespacePath(existing.mountPoint) || ref.pid >= procNamespacePID(existing.mountPoint) {
-				continue
-			}
-		}
-		byID[nsID] = discoveredNamespace{
-			namespaceID: nsID,
-			mountPoint:  ref.path,
-			displayName: ref.path,
-			shortName:   ref.path,
-			isCurrent:   nsID == selfNamespaceID,
-			sortKey:     ref.path,
-		}
-	}
-
-	// Slice and sort
 	items := make([]discoveredNamespace, 0, len(byID))
 	for _, item := range byID {
 		items = append(items, item)
@@ -355,6 +315,7 @@ func (s *Store) namespaceStates() []*namespaceState {
 }
 
 func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
+	metaChanged := false
 	for nsID := range s.ifacesByNS {
 		if _, ok := states[nsID]; !ok {
 			delete(s.ifacesByNS, nsID)
@@ -377,6 +338,7 @@ func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
 				delete(s.processRecords, key)
 				delete(s.processMeta, key)
 				delete(s.processPrev, key)
+				metaChanged = true
 			}
 		}
 	}
@@ -386,9 +348,14 @@ func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
 			if _, exists := states[nsID]; !exists {
 				delete(s.linkRecords, key)
 				delete(s.linkMeta, key)
-				delete(s.linkPrev, key)
+				delete(s.linkHistory, key)
+				metaChanged = true
 			}
 		}
+	}
+	if metaChanged {
+		debuglog.Tracef("store.pruneNamespaceCaches meta changed")
+		s.bumpMetaRevisionLocked()
 	}
 }
 

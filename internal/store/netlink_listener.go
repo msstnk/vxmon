@@ -9,6 +9,7 @@ import (
 
 	"github.com/msstnk/vxmon/internal/constants"
 	"github.com/msstnk/vxmon/internal/debuglog"
+	"github.com/msstnk/vxmon/internal/types"
 )
 
 // netlink_listener.go subscribes to kernel netlink streams for every discovered namespace.
@@ -18,23 +19,26 @@ type namespaceSubscription struct {
 	done chan struct{}
 }
 
-func ListenNetlink(ctx context.Context, selfNamespaceID uint64, send func(any)) {
+func (s *Store) ListenNetlink(ctx context.Context, send func(any)) {
 	debuglog.Infof("store.ListenNetlink start")
 	subs := map[uint64]*namespaceSubscription{}
-	resync := func() {
-		targets, err := discoverNamespaces(selfNamespaceID, nil)
-		if err != nil {
-			debuglog.Errorf("store.ListenNetlink discoverNamespaces failed: %v", err)
-			return
-		}
 
-		current := make(map[uint64]discoveredNamespace, len(targets))
+	resync := func() {
+		debuglog.Tracef("store.ListenNetlink resync")
+
+		s.mu.RLock()
+		targets := make([]types.NamespaceInfo, len(s.namespaces))
+		copy(targets, s.namespaces)
+		s.mu.RUnlock()
+
+		current := make(map[uint64]types.NamespaceInfo, len(targets))
 		for _, target := range targets {
-			current[target.namespaceID] = target
+			current[target.ID] = target
 		}
 
 		changed := false
-		newTargets := make([]discoveredNamespace, 0)
+		newTargets := make([]types.NamespaceInfo, 0)
+
 		for id, sub := range subs {
 			if _, ok := current[id]; ok {
 				continue
@@ -45,8 +49,9 @@ func ListenNetlink(ctx context.Context, selfNamespaceID uint64, send func(any)) 
 			changed = true
 		}
 
+		// 新規追加されたNamespaceを抽出
 		for _, target := range targets {
-			if _, ok := subs[target.namespaceID]; ok {
+			if _, ok := subs[target.ID]; ok {
 				continue
 			}
 			newTargets = append(newTargets, target)
@@ -57,14 +62,16 @@ func ListenNetlink(ctx context.Context, selfNamespaceID uint64, send func(any)) 
 			send(NamespaceSyncMsg{At: time.Now()})
 		}
 
+		// 新規Namespaceの購読を開始
 		for _, target := range newTargets {
 			done := make(chan struct{})
+			// 注意: startNamespaceSubscription は types.NamespaceInfo を受け取る必要があります
 			if err := startNamespaceSubscription(ctx, target, done, send); err != nil {
-				debuglog.Errorf("store.ListenNetlink subscribe namespace=%d failed: %v", target.namespaceID, err)
+				debuglog.Errorf("store.ListenNetlink subscribe namespace=%d failed: %v", target.ID, err)
 				continue
 			}
-			subs[target.namespaceID] = &namespaceSubscription{id: target.namespaceID, done: done}
-			debuglog.Infof("store.ListenNetlink subscribe namespace=%d path=%s", target.namespaceID, target.mountPoint)
+			subs[target.ID] = &namespaceSubscription{id: target.ID, done: done}
+			debuglog.Infof("store.ListenNetlink subscribe namespace=%d path=%s", target.ID, target.MountPoint)
 		}
 	}
 
@@ -88,11 +95,11 @@ func ListenNetlink(ctx context.Context, selfNamespaceID uint64, send func(any)) 
 	}
 }
 
-func startNamespaceSubscription(ctx context.Context, target discoveredNamespace, done chan struct{}, send func(any)) error {
-	debuglog.Tracef("store.startNamespaceSubscription namespace=%d path=%s", target.namespaceID, target.mountPoint)
+func startNamespaceSubscription(ctx context.Context, target types.NamespaceInfo, done chan struct{}, send func(any)) error {
+	debuglog.Tracef("store.startNamespaceSubscription namespace=%d path=%s", target.ID, target.MountPoint)
 	ns := netns.None()
-	if !target.isCurrent {
-		nsHandle, err := netns.GetFromPath(target.mountPoint)
+	if !target.IsCurrent {
+		nsHandle, err := netns.GetFromPath(target.MountPoint)
 		if err != nil {
 			return err
 		}
@@ -116,10 +123,10 @@ func startNamespaceSubscription(ctx context.Context, target discoveredNamespace,
 
 	go func() {
 		nsInfo := ListenerNamespace{
-			ID:        target.namespaceID,
-			Path:      target.mountPoint,
-			ShortName: target.shortName,
-			IsRoot:    target.isRoot,
+			ID:        target.ID,
+			Path:      target.MountPoint,
+			ShortName: target.ShortName,
+			IsRoot:    target.IsRoot,
 		}
 		for {
 			select {
@@ -128,13 +135,13 @@ func startNamespaceSubscription(ctx context.Context, target discoveredNamespace,
 			case <-done:
 				return
 			case u := <-neighCh:
-				debuglog.Tracef("store.ListenNetlink neigh namespace=%d type=%d", target.namespaceID, u.Type)
+				debuglog.Tracef("store.ListenNetlink neigh namespace=%d type=%d", target.ID, u.Type)
 				send(NeighNLMsg{Namespace: nsInfo, Update: u, At: time.Now()})
 			case u := <-routeCh:
-				debuglog.Tracef("store.ListenNetlink route namespace=%d type=%d", target.namespaceID, u.Type)
+				debuglog.Tracef("store.ListenNetlink route namespace=%d type=%d", target.ID, u.Type)
 				send(RouteNLMsg{Namespace: nsInfo, Update: u, At: time.Now()})
 			case u := <-linkCh:
-				debuglog.Tracef("store.ListenNetlink link namespace=%d type=%d", target.namespaceID, u.Type)
+				debuglog.Tracef("store.ListenNetlink link namespace=%d type=%d", target.ID, u.Type)
 				send(LinkNLMsg{Namespace: nsInfo, Update: u, At: time.Now()})
 			}
 		}

@@ -15,7 +15,7 @@ func reconcile[T any](
 	keyFn func(T) string,
 	fpFn func(T) string,
 	now time.Time,
-) (map[string]T, map[string]Meta) {
+) (map[string]T, map[string]Meta, bool) {
 	return reconcileScoped(oldMap, oldMeta, newList, keyFn, fpFn, func(string) bool { return true }, now)
 }
 
@@ -27,7 +27,7 @@ func reconcileNamespace[T any](
 	fpFn func(T) string,
 	namespaceID uint64,
 	now time.Time,
-) (map[string]T, map[string]Meta) {
+) (map[string]T, map[string]Meta, bool) {
 	prefix := strconv.FormatUint(namespaceID, 10) + "|"
 	return reconcileScoped(oldMap, oldMeta, newList, keyFn, fpFn, func(key string) bool {
 		return strings.HasPrefix(key, prefix)
@@ -42,7 +42,8 @@ func reconcileScoped[T any](
 	fpFn func(T) string,
 	shouldRemove func(string) bool,
 	now time.Time,
-) (map[string]T, map[string]Meta) {
+) (map[string]T, map[string]Meta, bool) {
+	changed := false
 	newMap := make(map[string]T, len(newList))
 	newFP := make(map[string]string, len(newList))
 	for _, v := range newList {
@@ -57,18 +58,21 @@ func reconcileScoped[T any](
 		if !ok {
 			oldMeta[k] = Meta{State: StateAdded, ChangedAt: now, Fingerprint: fp}
 			oldMap[k] = v
+			changed = true
 			continue
 		}
 
 		if prev.State == StateRemoved {
 			oldMap[k] = v
 			oldMeta[k] = Meta{State: StateAdded, ChangedAt: now, Fingerprint: fp}
+			changed = true
 			continue
 		}
 
 		if prev.Fingerprint != fp {
 			oldMap[k] = v
 			oldMeta[k] = Meta{State: StateUpdated, ChangedAt: now, Fingerprint: fp}
+			changed = true
 			continue
 		}
 
@@ -89,7 +93,8 @@ func reconcileScoped[T any](
 			prev.State = StateRemoved
 			prev.ChangedAt = now
 			oldMeta[k] = prev
+			changed = true
 		}
 	}
-	return oldMap, oldMeta
+	return oldMap, oldMeta, changed
 }

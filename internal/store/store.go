@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -37,6 +39,10 @@ type Record[T any] struct {
 }
 
 type Store struct {
+	mu sync.RWMutex
+
+	eventCh chan storeEvent
+
 	selfNamespaceID uint64
 
 	namespaces     []types.NamespaceInfo
@@ -63,7 +69,7 @@ type Store struct {
 	linkMeta       map[string]Meta
 
 	processPrev  map[string]processSample
-	linkPrev     map[string]linkSample
+	linkHistory  map[string]*linkSampleRing
 	prevTotalCPU uint64
 
 	vrfUsedIfByNS        map[uint64]map[int]struct{}
@@ -71,7 +77,13 @@ type Store struct {
 	vrfUsedIfCompactHold map[uint64]map[int]time.Time
 	bridgePortUsedByNS   map[uint64]map[int]struct{}
 
-	lastRuntime time.Time
+	lastRuntime  time.Time
+	metaRevision uint64
+
+	nsReloadRefreshedAt map[uint64]time.Time
+	nsReloadDirty       map[uint64]nlReloadMask
+	nsReloadDueAt       map[uint64]time.Time
+	nsReloadPending     map[uint64]bool
 }
 
 func New() *Store {
@@ -81,6 +93,7 @@ func New() *Store {
 	}
 
 	return &Store{
+		eventCh:              make(chan storeEvent, 1024),
 		selfNamespaceID:      selfNamespaceID,
 		namespacesByID:       map[uint64]*namespaceState{},
 		neigh:                map[string]types.NeighEntry{},
@@ -97,27 +110,39 @@ func New() *Store {
 		linkRecords:          map[string]types.NamespaceLinkInfo{},
 		linkMeta:             map[string]Meta{},
 		processPrev:          map[string]processSample{},
-		linkPrev:             map[string]linkSample{},
+		linkHistory:          map[string]*linkSampleRing{},
 		vrfUsedIfByNS:        map[uint64]map[int]struct{}{},
 		vrfUsedIfCompactByNS: map[uint64]map[int]struct{}{},
 		vrfUsedIfCompactHold: map[uint64]map[int]time.Time{},
 		bridgePortUsedByNS:   map[uint64]map[int]struct{}{},
+		nsReloadRefreshedAt:  map[uint64]time.Time{},
+		nsReloadDirty:        map[uint64]nlReloadMask{},
+		nsReloadDueAt:        map[uint64]time.Time{},
+		nsReloadPending:      map[uint64]bool{},
 	}
 }
 
 func (s *Store) SelfNamespaceID() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.selfNamespaceID
+}
+
+func (s *Store) Run(ctx context.Context, send func(any)) {
+	s.runLoop(ctx, send)
+}
+
+func (s *Store) RequestFetchLatest(at time.Time) {
+	s.enqueueEvent(storeEvent{kind: storeEventFetchLatest, at: at})
 }
 
 func (s *Store) ReloadAll(now time.Time) error {
 	debuglog.Tracef("store.ReloadAll")
-	if err := s.syncNamespaces(); err != nil {
-		return err
-	}
-	s.reloadInterfaces()
+	s.reloadRuntime(now)
+	s.reloadInterfaces(now)
 	s.reloadNeighAndFDB(now)
 	s.reloadRoutes(now)
-	return s.reloadRuntime(now)
+	return nil
 }
 
 func (s *Store) ReloadInterfaces() error {
@@ -125,18 +150,18 @@ func (s *Store) ReloadInterfaces() error {
 	if err := s.syncNamespaces(); err != nil {
 		return err
 	}
-	s.reloadInterfaces()
+	s.reloadInterfaces(time.Now())
 	return nil
 }
 
-func (s *Store) ReloadNamespaceInterfaces(namespaceID uint64) error {
+func (s *Store) ReloadNamespaceInterfaces(namespaceID uint64, now time.Time) error {
 	debuglog.Tracef("store.ReloadNamespaceInterfaces namespace=%d", namespaceID)
 	state := s.namespaceState(namespaceID)
 	if state == nil {
 		debuglog.Tracef("store.ReloadNamespaceInterfaces namespace=%d skipped: namespace not synced yet", namespaceID)
 		return nil
 	}
-	s.reloadNamespaceInterfaces(state)
+	s.reloadNamespaceInterfaces(state, now)
 	s.rebuildInterfaces()
 	return nil
 }
@@ -193,17 +218,28 @@ func (s *Store) ReloadNamespaceLinks(namespaceID uint64, now time.Time) error {
 		debuglog.Tracef("store.ReloadNamespaceLinks namespace=%d skipped: namespace not synced yet", namespaceID)
 		return nil
 	}
-	s.reloadNamespaceLinks(state, now)
+	s.reloadNamespaceInterfaces(state, now)
+	s.rebuildInterfaces()
 	return nil
 }
 
 func (s *Store) RuntimeRefreshDue(now time.Time) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.lastRuntime.IsZero() || now.Sub(s.lastRuntime) >= constants.RuntimeRefreshInterval
 }
 
-func (s *Store) reloadInterfaces() {
+func (s *Store) metaRevisionLocked() uint64 {
+	return s.metaRevision
+}
+
+func (s *Store) bumpMetaRevisionLocked() {
+	s.metaRevision++
+}
+
+func (s *Store) reloadInterfaces(now time.Time) {
 	for _, state := range s.namespaceStates() {
-		s.reloadNamespaceInterfaces(state)
+		s.reloadNamespaceInterfaces(state, now)
 	}
 	s.rebuildInterfaces()
 }
@@ -226,42 +262,64 @@ func (s *Store) Advance(now time.Time) (changed bool, active bool) {
 	var metaChanged bool
 	var metaActive bool
 	refChanged := false
+	changed = false
+	active = false
 
 	metaChanged, metaActive = advanceMeta(s.neighMeta, s.neigh, now)
+	if metaChanged {
+		debuglog.Tracef("store.Advance neigh meta changed")
+	}
 	changed = changed || metaChanged
 	active = active || metaActive
 	refChanged = refChanged || metaChanged
 
 	metaChanged, metaActive = advanceMeta(s.fdbMeta, s.fdb, now)
+	if metaChanged {
+		debuglog.Tracef("store.Advance fdb meta changed")
+	}
 	changed = changed || metaChanged
 	active = active || metaActive
 	refChanged = refChanged || metaChanged
 
 	metaChanged, metaActive = advanceMeta(s.routeMeta, s.routes, now)
+	if metaChanged {
+		debuglog.Tracef("store.Advance route meta changed")
+	}
 	changed = changed || metaChanged
 	active = active || metaActive
 	refChanged = refChanged || metaChanged
 
+	// Do not track process meta changes as they are too noisy
 	metaChanged, metaActive = advanceMeta(s.processMeta, s.processRecords, now)
-	changed = changed || metaChanged
-	active = active || metaActive
+	// if metaChanged {
+	// 	debuglog.Tracef("store.Advance process meta changed")
+	// }
+	// changed = changed || metaChanged
+	// active = active || metaActive
 
 	metaChanged, metaActive = advanceMeta(s.linkMeta, s.linkRecords, now)
+	if metaChanged {
+		debuglog.Tracef("store.Advance link meta changed")
+	}
 	changed = changed || metaChanged
 	active = active || metaActive
 
 	if refChanged {
 		s.rebuildReferenceMaps()
 	}
+	if changed {
+		s.bumpMetaRevisionLocked()
+	}
 
 	return changed, active
 }
 
 func (s *Store) HasActiveFades() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return hasActiveMeta(s.neighMeta) ||
 		hasActiveMeta(s.fdbMeta) ||
 		hasActiveMeta(s.routeMeta) ||
-		hasActiveMeta(s.processMeta) ||
 		hasActiveMeta(s.linkMeta)
 }
 
@@ -296,21 +354,35 @@ func hasActiveMeta(metaMap map[string]Meta) bool {
 	return false
 }
 
-func (s *Store) reloadNamespaceInterfaces(state *namespaceState) {
+func (s *Store) reloadNamespaceInterfaces(state *namespaceState, now time.Time) {
 	if state == nil {
 		return
 	}
 	if state.handle == nil {
 		s.ifacesByNS[state.info.ID] = nil
+		s.links[state.info.ID] = nil
+		var changed bool
+		s.linkRecords, s.linkMeta, changed = reconcileNamespace(s.linkRecords, s.linkMeta, nil, linkKey, linkFingerprint, state.info.ID, now)
+		if changed {
+			s.bumpMetaRevisionLocked()
+		}
 		return
 	}
 
-	items, err := getInterfaceInfo(state.handle, state.info, int(state.nsHandle))
+	raw, err := getInterfaceList(state.info, int(state.nsHandle), now, s.linkHistory)
 	if err != nil {
 		debuglog.Errorf("store.reloadNamespaceInterfaces namespace=%d failed: %v", state.info.ID, err)
 		return
 	}
-	s.ifacesByNS[state.info.ID] = items
+	ifaces, links := parseInterfaceList(raw, state.info, s.linkHistory)
+	s.ifacesByNS[state.info.ID] = ifaces
+	s.links[state.info.ID] = links
+	var changed bool
+	s.linkRecords, s.linkMeta, changed = reconcileNamespace(s.linkRecords, s.linkMeta, links, linkKey, linkFingerprint, state.info.ID, now)
+	if changed {
+		debuglog.Tracef("store.reloadNamespaceInterfaces namespace=%d link meta changed", state.info.ID)
+		s.bumpMetaRevisionLocked()
+	}
 }
 
 func (s *Store) rebuildInterfaces() {
@@ -333,24 +405,41 @@ func (s *Store) reloadNamespaceNeighAndFDB(state *namespaceState, now time.Time)
 
 	var neighList []types.NeighEntry
 	var fdbList []types.FdbEntry
+	var linksRaw linkListRaw
 	if state.handle != nil {
-		items, err := getNeighList(state.handle, state.info)
+		rawLinks, err := getLinkListRaw(state.handle)
+		if err != nil {
+			debuglog.Errorf("store.reloadNamespaceNeighAndFDB links namespace=%d failed: %v", state.info.ID, err)
+		} else {
+			linksRaw = rawLinks
+		}
+
+		rawNeigh, err := getNeighList(state.handle, state.info)
 		if err != nil {
 			debuglog.Errorf("store.reloadNamespaceNeighAndFDB neigh namespace=%d failed: %v", state.info.ID, err)
 		} else {
-			neighList = items
+			neighList = parseNeighList(rawNeigh, linksRaw, state.info)
 		}
 
-		itemsFDB, err := getFdbList(state.handle, state.info)
+		rawFDB, err := getFdbList(state.handle, state.info)
 		if err != nil {
 			debuglog.Errorf("store.reloadNamespaceNeighAndFDB fdb namespace=%d failed: %v", state.info.ID, err)
 		} else {
-			fdbList = itemsFDB
+			fdbList = parseFdbList(rawFDB, linksRaw, state.info)
 		}
 	}
 
-	s.neigh, s.neighMeta = reconcileNamespace(s.neigh, s.neighMeta, neighList, neighKey, neighFingerprint, state.info.ID, now)
-	s.fdb, s.fdbMeta = reconcileNamespace(s.fdb, s.fdbMeta, fdbList, fdbKey, fdbFingerprint, state.info.ID, now)
+	var changed bool
+	s.neigh, s.neighMeta, changed = reconcileNamespace(s.neigh, s.neighMeta, neighList, neighKey, neighFingerprint, state.info.ID, now)
+	if changed {
+		debuglog.Tracef("store.reloadNamespaceNeighAndFDB namespace=%d neigh meta changed", state.info.ID)
+		s.bumpMetaRevisionLocked()
+	}
+	s.fdb, s.fdbMeta, changed = reconcileNamespace(s.fdb, s.fdbMeta, fdbList, fdbKey, fdbFingerprint, state.info.ID, now)
+	if changed {
+		debuglog.Tracef("store.reloadNamespaceNeighAndFDB namespace=%d fdb meta changed", state.info.ID)
+		s.bumpMetaRevisionLocked()
+	}
 }
 
 func (s *Store) reloadNamespaceRoutes(state *namespaceState, now time.Time) {
@@ -359,15 +448,28 @@ func (s *Store) reloadNamespaceRoutes(state *namespaceState, now time.Time) {
 	}
 
 	var routeList []types.RouteEntry
+	var linksRaw linkListRaw
 	if state.handle != nil {
-		items, err := getRouteList(state.handle, state.info)
+		rawLinks, err := getLinkListRaw(state.handle)
+		if err != nil {
+			debuglog.Errorf("store.reloadNamespaceRoutes links namespace=%d failed: %v", state.info.ID, err)
+		} else {
+			linksRaw = rawLinks
+		}
+
+		raw, err := getRouteList(state.handle, state.info)
 		if err != nil {
 			debuglog.Errorf("store.reloadNamespaceRoutes namespace=%d failed: %v", state.info.ID, err)
 		} else {
-			routeList = items
+			routeList = parseRouteList(raw, linksRaw, state.info)
 		}
 	}
-	s.routes, s.routeMeta = reconcileNamespace(s.routes, s.routeMeta, routeList, routeKey, routeFingerprint, state.info.ID, now)
+	var changed bool
+	s.routes, s.routeMeta, changed = reconcileNamespace(s.routes, s.routeMeta, routeList, routeKey, routeFingerprint, state.info.ID, now)
+	if changed {
+		debuglog.Tracef("store.reloadNamespaceRoutes namespace=%d route meta changed", state.info.ID)
+		s.bumpMetaRevisionLocked()
+	}
 }
 
 func (s *Store) namespaceState(namespaceID uint64) *namespaceState {
@@ -375,12 +477,16 @@ func (s *Store) namespaceState(namespaceID uint64) *namespaceState {
 }
 
 func (s *Store) Namespaces() []types.NamespaceInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]types.NamespaceInfo, len(s.namespaces))
 	copy(out, s.namespaces)
 	return out
 }
 
 func (s *Store) NamespaceInfo(id uint64) (types.NamespaceInfo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	state := s.namespacesByID[id]
 	if state == nil {
 		return types.NamespaceInfo{}, false
@@ -389,12 +495,16 @@ func (s *Store) NamespaceInfo(id uint64) (types.NamespaceInfo, bool) {
 }
 
 func (s *Store) Interfaces() []types.InterfaceInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]types.InterfaceInfo, len(s.ifaces))
 	copy(out, s.ifaces)
 	return out
 }
 
 func (s *Store) IsVRFInterfaceReferenced(namespaceID uint64, ifIndex int, detailed bool) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if detailed {
 		_, ok := s.vrfUsedIfByNS[namespaceID][ifIndex]
 		return ok
@@ -410,6 +520,8 @@ func (s *Store) IsVRFInterfaceReferenced(namespaceID uint64, ifIndex int, detail
 }
 
 func (s *Store) IsBridgePortReferenced(namespaceID uint64, ifIndex int) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	_, ok := s.bridgePortUsedByNS[namespaceID][ifIndex]
 	return ok
 }
@@ -529,6 +641,8 @@ func collectRecords[T any](
 }
 
 func (s *Store) NeighRecords(includeRemoved bool) []Record[types.NeighEntry] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := collectRecords(s.neigh, s.neighMeta, includeRemoved, nil)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Val.NamespaceRoot != out[j].Val.NamespaceRoot {
@@ -546,6 +660,8 @@ func (s *Store) NeighRecords(includeRemoved bool) []Record[types.NeighEntry] {
 }
 
 func (s *Store) FDBRecords(includeRemoved bool) []Record[types.FdbEntry] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := collectRecords(s.fdb, s.fdbMeta, includeRemoved, nil)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Val.NamespaceRoot != out[j].Val.NamespaceRoot {
@@ -569,6 +685,8 @@ func (s *Store) FDBRecords(includeRemoved bool) []Record[types.FdbEntry] {
 }
 
 func (s *Store) RouteRecords(includeRemoved bool) []Record[types.RouteEntry] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := collectRecords(s.routes, s.routeMeta, includeRemoved, nil)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Val.NamespaceRoot != out[j].Val.NamespaceRoot {
@@ -586,6 +704,8 @@ func (s *Store) RouteRecords(includeRemoved bool) []Record[types.RouteEntry] {
 }
 
 func (s *Store) NamespaceProcesses(nsID uint64) []types.ProcessInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	rows := s.processes[nsID]
 	out := make([]types.ProcessInfo, len(rows))
 	copy(out, rows)
@@ -593,6 +713,8 @@ func (s *Store) NamespaceProcesses(nsID uint64) []types.ProcessInfo {
 }
 
 func (s *Store) NamespaceProcessRecords(nsID uint64, includeRemoved bool) []Record[types.ProcessInfo] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	prefix := strconv.FormatUint(nsID, 10) + "|"
 	out := collectRecords(s.processRecords, s.processMeta, includeRemoved, func(key string, _ types.ProcessInfo) bool {
 		return strings.HasPrefix(key, prefix)
@@ -607,6 +729,8 @@ func (s *Store) NamespaceProcessRecords(nsID uint64, includeRemoved bool) []Reco
 }
 
 func (s *Store) NamespaceLinks(nsID uint64) []types.NamespaceLinkInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	rows := s.links[nsID]
 	out := make([]types.NamespaceLinkInfo, len(rows))
 	copy(out, rows)
@@ -614,6 +738,8 @@ func (s *Store) NamespaceLinks(nsID uint64) []types.NamespaceLinkInfo {
 }
 
 func (s *Store) NamespaceLinkRecords(nsID uint64, includeRemoved bool) []Record[types.NamespaceLinkInfo] {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	prefix := strconv.FormatUint(nsID, 10) + "|"
 	out := collectRecords(s.linkRecords, s.linkMeta, includeRemoved, func(key string, _ types.NamespaceLinkInfo) bool {
 		return strings.HasPrefix(key, prefix)

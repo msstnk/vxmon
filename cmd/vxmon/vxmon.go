@@ -39,11 +39,11 @@ func main() {
 	defer cancel()
 
 	st := store.New()
-	m := app.NewModel(st)
+	m := app.NewModel(st, st.RequestFetchLatest)
 
 	p := tea.NewProgram(&m, tea.WithAltScreen())
 
-	go store.ListenNetlink(ctx, st.SelfNamespaceID(), func(msg any) {
+	go st.Run(ctx, func(msg any) {
 		p.Send(msg)
 	})
 
@@ -54,15 +54,14 @@ func main() {
 }
 
 func startCPUProfileFromEnv() (func(), error) {
-	path := os.Getenv("VXMON_CPU_PROFILE")
-	if path == "" {
+	val := os.Getenv("VXMON_CPU_PROFILE")
+	if val != "1" {
 		return func() {}, nil
 	}
-	if path == "1" {
-		path = "cpu.pprof"
-	}
 
-	f, err := os.Create(path)
+	const filepath = "cpu.pprof"
+
+	f, err := os.OpenFile(filepath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +69,7 @@ func startCPUProfileFromEnv() (func(), error) {
 		f.Close()
 		return nil, err
 	}
-	debuglog.Infof("cpu profiling enabled path=%s", path)
+	debuglog.Infof("cpu profiling enabled path=%s", filepath)
 
 	return func() {
 		pprof.StopCPUProfile()
