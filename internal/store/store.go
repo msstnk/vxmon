@@ -290,12 +290,7 @@ func (s *Store) Advance(now time.Time) (changed bool, active bool) {
 	refChanged = refChanged || metaChanged
 
 	// Do not track process meta changes as they are too noisy
-	metaChanged, metaActive = advanceMeta(s.processMeta, s.processRecords, now)
-	// if metaChanged {
-	// 	debuglog.Tracef("store.Advance process meta changed")
-	// }
-	// changed = changed || metaChanged
-	// active = active || metaActive
+	_, _ = advanceMeta(s.processMeta, s.processRecords, now)
 
 	metaChanged, metaActive = advanceMeta(s.linkMeta, s.linkRecords, now)
 	if metaChanged {

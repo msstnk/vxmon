@@ -512,18 +512,6 @@ func (m *Model) moveTopBoundary(last bool) {
 	}
 	m.botCursor, m.botViewport = 0, 0
 }
-func (m *Model) moveBottomCursor(delta int) {
-	items := m.bottomRows
-	maxIdx := min(len(items)-1, 0)
-	m.botCursor = clamp(m.botCursor+delta, 0, maxIdx)
-}
-func (m *Model) moveBottomPage(delta int, visibleBottom int) {
-	step := visibleBottom
-	if step < 1 {
-		step = 1
-	}
-	m.moveBottomCursor(delta * step)
-}
 
 func (m *Model) moveBottomBoundary(last bool, visibleBottom int) {
 	if last {

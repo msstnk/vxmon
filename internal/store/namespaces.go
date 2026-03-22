@@ -140,23 +140,6 @@ func discoverNamespaces(selfNamespaceID uint64, procScan *procScanResult) ([]dis
 	return items, nil
 }
 
-func isProcNamespacePath(path string) bool {
-	return strings.HasPrefix(path, "/proc/") && strings.HasSuffix(path, "/ns/net")
-}
-
-func procNamespacePID(path string) int {
-	trimmed := strings.TrimPrefix(path, "/proc/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 {
-		return 0
-	}
-	pid, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0
-	}
-	return pid
-}
-
 func readNamespaceID(path string) (uint64, error) {
 	file, err := os.Open(path)
 	if err != nil {

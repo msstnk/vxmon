@@ -21,7 +21,7 @@ func (m *Model) withHelpOverlay() string {
 		"  Up/Down    : Move next/previous (VRF, Bridge, Route, etc)",
 		"  PgDn/PgUp  : Move by one visible page",
 		"  Home/End   : Move to first/last item",
-		"  t / T      : Change top pane height (30%-60%)",
+		"  t          : Change top pane height (30%-60%)",
 		"  d          : Toggle detailed view (show multicast, etc)",
 		"  h / ?      : Toggle this help (any key to close)",
 		"  . / ,      : Move to next/previous child item",

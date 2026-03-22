@@ -49,7 +49,6 @@ func (s *Store) ListenNetlink(ctx context.Context, send func(any)) {
 			changed = true
 		}
 
-		// 新規追加されたNamespaceを抽出
 		for _, target := range targets {
 			if _, ok := subs[target.ID]; ok {
 				continue
@@ -62,10 +61,8 @@ func (s *Store) ListenNetlink(ctx context.Context, send func(any)) {
 			send(NamespaceSyncMsg{At: time.Now()})
 		}
 
-		// 新規Namespaceの購読を開始
 		for _, target := range newTargets {
 			done := make(chan struct{})
-			// 注意: startNamespaceSubscription は types.NamespaceInfo を受け取る必要があります
 			if err := startNamespaceSubscription(ctx, target, done, send); err != nil {
 				debuglog.Errorf("store.ListenNetlink subscribe namespace=%d failed: %v", target.ID, err)
 				continue
