@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 type Level int
@@ -30,7 +32,7 @@ func ConfigureFromEnv(path string) (io.Closer, error) {
 		return nil, nil
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return nil, err
 	}
