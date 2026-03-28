@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	AppTitle                  = "vxmon 0.1.4"
+	AppTitle                  = "vxmon 0.1.5"
 	ClockTickInterval         = time.Second
 	AnimTickInterval          = 100 * time.Millisecond
 	NLMsgAggregationTimer     = 50 * time.Millisecond
