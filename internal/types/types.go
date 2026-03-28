@@ -21,7 +21,7 @@ type InterfaceInfo struct {
 	NamespaceName    string
 	NamespaceDisplay string
 	NamespaceRoot    bool
-	InterfaceID      int
+	IfIndex          int
 	InterfaceName    string
 	IfType           string
 	Status           string
@@ -62,7 +62,7 @@ type NeighEntry struct {
 	IP               string
 	MACAddr          string
 	State            int
-	InterfaceID      int
+	IfIndex          int
 	InterfaceName    string
 	VLANID           int
 	VxlanID          int
@@ -79,7 +79,9 @@ type RouteEntry struct {
 	NamespaceName    string
 	NamespaceDisplay string
 	NamespaceRoot    bool
+	IfIndex          int
 	Dst              string
+	Prefix           int
 	Src              string
 	Table            uint32
 	Priority         int
@@ -99,7 +101,7 @@ type ProcessInfo struct {
 
 type NamespaceLinkInfo struct {
 	NamespaceID uint64
-	InterfaceID int
+	IfIndex     int
 	Name        string
 	Type        string
 	RxBps       uint64

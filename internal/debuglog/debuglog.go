@@ -55,12 +55,6 @@ func SetLevel(next Level) {
 	mu.Unlock()
 }
 
-func Enabled(target Level) bool {
-	mu.RLock()
-	defer mu.RUnlock()
-	return level >= target
-}
-
 func Errorf(format string, args ...any) {
 	logf(LevelError, "ERROR", format, args...)
 }

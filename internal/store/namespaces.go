@@ -185,7 +185,7 @@ func (s *Store) syncNamespaces() error {
 
 func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 	debuglog.Tracef("store.syncNamespaces")
-	discovered, err := discoverNamespaces(s.selfNamespaceID, procScan)
+	discovered, err := discoverNamespaces(s.inventory.selfNamespaceID, procScan)
 	if err != nil {
 		return err
 	}
@@ -194,68 +194,96 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 	nextList := make([]types.NamespaceInfo, 0, len(discovered))
 
 	for _, item := range discovered {
-		state, ok := s.namespacesByID[item.namespaceID]
-		if ok && state.mountPoint == item.mountPoint && state.info.IsRoot == item.isRoot && state.info.IsCurrent == item.isCurrent {
-			state.info.DisplayName = item.displayName
-			state.info.MountPoint = item.mountPoint
-			state.info.ShortName = item.shortName
-			state.info.IsCurrent = item.isCurrent
-			if state.handle == nil {
-				handle, nsHandle, handleErr := newNamespaceHandle(item)
-				state.handle = handle
-				state.nsHandle = nsHandle
-				state.info.PermissionErr = permissionText(handleErr)
-			} else {
-				state.info.PermissionErr = ""
-			}
+		state, ok := s.inventory.namespacesByID[item.namespaceID]
+		if ok && s.reuseNamespaceState(state, item) {
 			nextStates[item.namespaceID] = state
+			s.ensureNamespaceTopology(item.namespaceID)
 			nextList = append(nextList, state.info)
 			continue
 		}
-
 		if ok {
-			if state.handle != nil {
-				state.handle.Close()
-			}
+			s.closeNamespaceState(state)
 		}
-
-		info := types.NamespaceInfo{
-			ID:          item.namespaceID,
-			MountPoint:  item.mountPoint,
-			DisplayName: item.displayName,
-			ShortName:   item.shortName,
-			IsRoot:      item.isRoot,
-			IsCurrent:   item.isCurrent,
-		}
-
-		handle, nsHandle, handleErr := newNamespaceHandle(item)
-		info.PermissionErr = permissionText(handleErr)
-		nextStates[item.namespaceID] = &namespaceState{
-			info:       info,
-			mountPoint: item.mountPoint,
-			handle:     handle,
-			nsHandle:   nsHandle,
-		}
-		nextList = append(nextList, info)
+		state = s.openNamespaceState(item)
+		nextStates[item.namespaceID] = state
+		s.ensureNamespaceTopology(item.namespaceID)
+		nextList = append(nextList, state.info)
 	}
+	s.closeRemovedNamespaceStates(nextStates)
 
-	for id, state := range s.namespacesByID {
+	s.inventory.namespacesByID = nextStates
+	s.inventory.namespaces = nextList
+	s.pruneNamespaceCaches(nextStates)
+	return nil
+}
+
+func (s *Store) ensureNamespaceTopology(namespaceID uint64) {
+	if _, ok := s.inventory.topology[namespaceID]; !ok {
+		s.inventory.topology[namespaceID] = newTopologyState()
+	}
+}
+
+func (s *Store) reuseNamespaceState(state *namespaceState, item discoveredNamespace) bool {
+	if state == nil {
+		return false
+	}
+	if state.mountPoint != item.mountPoint || state.info.IsRoot != item.isRoot || state.info.IsCurrent != item.isCurrent {
+		return false
+	}
+	state.info.DisplayName = item.displayName
+	state.info.MountPoint = item.mountPoint
+	state.info.ShortName = item.shortName
+	state.info.IsCurrent = item.isCurrent
+	if state.handle != nil {
+		state.info.PermissionErr = ""
+		return true
+	}
+	handle, nsHandle, handleErr := newNamespaceHandle(item)
+	state.handle = handle
+	state.nsHandle = nsHandle
+	state.info.PermissionErr = permissionText(handleErr)
+	return true
+}
+
+func (s *Store) openNamespaceState(item discoveredNamespace) *namespaceState {
+	info := types.NamespaceInfo{
+		ID:          item.namespaceID,
+		MountPoint:  item.mountPoint,
+		DisplayName: item.displayName,
+		ShortName:   item.shortName,
+		IsRoot:      item.isRoot,
+		IsCurrent:   item.isCurrent,
+	}
+	handle, nsHandle, handleErr := newNamespaceHandle(item)
+	info.PermissionErr = permissionText(handleErr)
+	return &namespaceState{
+		info:       info,
+		mountPoint: item.mountPoint,
+		handle:     handle,
+		nsHandle:   nsHandle,
+	}
+}
+
+func (s *Store) closeNamespaceState(state *namespaceState) {
+	if state == nil {
+		return
+	}
+	if state.handle != nil {
+		state.handle.Close()
+	}
+	if state.nsHandle.IsOpen() {
+		_ = state.nsHandle.Close()
+	}
+}
+
+func (s *Store) closeRemovedNamespaceStates(nextStates map[uint64]*namespaceState) {
+	for id, state := range s.inventory.namespacesByID {
 		if _, ok := nextStates[id]; ok {
 			continue
 		}
 		debuglog.Infof("store.syncNamespaces remove namespace=%d", id)
-		if state.handle != nil {
-			state.handle.Close()
-		}
-		if state.nsHandle.IsOpen() {
-			_ = state.nsHandle.Close()
-		}
+		s.closeNamespaceState(state)
 	}
-
-	s.namespacesByID = nextStates
-	s.namespaces = nextList
-	s.pruneNamespaceCaches(nextStates)
-	return nil
 }
 
 func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, netns.NsHandle, error) {
@@ -286,9 +314,9 @@ func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, netns.NsHand
 }
 
 func (s *Store) namespaceStates() []*namespaceState {
-	out := make([]*namespaceState, 0, len(s.namespaces))
-	for _, ns := range s.namespaces {
-		state := s.namespacesByID[ns.ID]
+	out := make([]*namespaceState, 0, len(s.inventory.namespaces))
+	for _, ns := range s.inventory.namespaces {
+		state := s.inventory.namespacesByID[ns.ID]
 		if state == nil {
 			continue
 		}
@@ -299,57 +327,74 @@ func (s *Store) namespaceStates() []*namespaceState {
 
 func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
 	metaChanged := false
-	for nsID := range s.ifacesByNS {
-		if _, ok := states[nsID]; !ok {
-			delete(s.ifacesByNS, nsID)
+	drop := func(keys []string, fn func(string)) {
+		for _, key := range keys {
+			fn(key)
+			metaChanged = true
 		}
 	}
-	for nsID := range s.processes {
-		if _, ok := states[nsID]; !ok {
-			delete(s.processes, nsID)
-		}
+	if dropMissingNamespaceMap(s.inventory.topology, states) {
+		metaChanged = true
 	}
-	for nsID := range s.links {
-		if _, ok := states[nsID]; !ok {
-			delete(s.links, nsID)
-		}
-	}
-	for key := range s.processRecords {
-		nsID, ok := namespaceIDFromRecordKey(key)
-		if ok {
-			if _, exists := states[nsID]; !exists {
-				delete(s.processRecords, key)
-				delete(s.processMeta, key)
-				delete(s.processPrev, key)
-				metaChanged = true
-			}
-		}
-	}
-	for key := range s.linkRecords {
-		nsID, ok := namespaceIDFromRecordKey(key)
-		if ok {
-			if _, exists := states[nsID]; !exists {
-				delete(s.linkRecords, key)
-				delete(s.linkMeta, key)
-				delete(s.linkHistory, key)
-				metaChanged = true
-			}
-		}
-	}
+	dropMissingNamespaceMap(s.runtimeState.processes, states)
+	dropMissingNamespaceMap(s.runtimeState.links, states)
+	dropMissingNamespaceMap(s.referenceState.vrfUsedIfByNS, states)
+	dropMissingNamespaceMap(s.referenceState.vrfUsedIfCompactByNS, states)
+	dropMissingNamespaceMap(s.referenceState.vrfUsedIfCompactHold, states)
+	dropMissingNamespaceMap(s.referenceState.bridgePortUsedByNS, states)
+	dropMissingNamespaceMap(s.reloadState.ns, states)
+
+	drop(staleRecordKeys(s.recordState.processRecords, states), func(key string) {
+		delete(s.recordState.processRecords, key)
+		delete(s.recordState.processMeta, key)
+		delete(s.runtimeState.processPrev, key)
+	})
+	drop(staleRecordKeys(s.recordState.linkRecords, states), func(key string) {
+		delete(s.recordState.linkRecords, key)
+		delete(s.recordState.linkMeta, key)
+		delete(s.runtimeState.linkHistory, key)
+	})
+	drop(staleRecordKeys(s.recordState.neighMeta, states), func(key string) {
+		delete(s.recordState.neighMeta, key)
+	})
+	drop(staleRecordKeys(s.recordState.fdbMeta, states), func(key string) {
+		delete(s.recordState.fdbMeta, key)
+	})
+	drop(staleRecordKeys(s.recordState.routeMeta, states), func(key string) {
+		delete(s.recordState.routeMeta, key)
+	})
+
+	s.rebuildInterfaceIndexes()
+	s.rebuildReferenceMaps()
 	if metaChanged {
 		debuglog.Tracef("store.pruneNamespaceCaches meta changed")
 		s.bumpMetaRevisionLocked()
 	}
 }
 
-func namespaceIDFromRecordKey(key string) (uint64, bool) {
-	head, _, ok := strings.Cut(key, "|")
-	if !ok {
-		return 0, false
+func dropMissingNamespaceMap[T any](m map[uint64]T, states map[uint64]*namespaceState) bool {
+	changed := false
+	for nsID := range m {
+		if _, ok := states[nsID]; ok {
+			continue
+		}
+		delete(m, nsID)
+		changed = true
 	}
-	nsID, err := strconv.ParseUint(head, 10, 64)
-	if err != nil {
-		return 0, false
+	return changed
+}
+
+func staleRecordKeys[T any](m map[string]T, states map[uint64]*namespaceState) []string {
+	out := make([]string, 0)
+	for key := range m {
+		nsID, ok := recordNamespaceID(key)
+		if !ok {
+			continue
+		}
+		if _, exists := states[nsID]; exists {
+			continue
+		}
+		out = append(out, key)
 	}
-	return nsID, true
+	return out
 }

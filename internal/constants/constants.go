@@ -10,7 +10,8 @@ const (
 	AppTitle                  = "vxmon 0.1.4"
 	ClockTickInterval         = time.Second
 	AnimTickInterval          = 100 * time.Millisecond
-	NLMsgThrottleInterval     = 50 * time.Millisecond
+	NLMsgAggregationTimer     = 50 * time.Millisecond
+	NLMsgThrottleInterval     = 200 * time.Millisecond
 	NamespaceResyncInterval   = 3 * time.Second
 	RuntimeRefreshInterval    = 5 * time.Second
 	LinkRateHistoryDepth      = 4

@@ -15,7 +15,7 @@ func bridgeParentKey(it bridgeItem) string {
 }
 
 func bridgeChildKey(parent bridgeItem, it types.InterfaceInfo) string {
-	return fmt.Sprintf("bridge-child|%d|%d|%d", parent.NamespaceID, parent.Info.InterfaceID, it.InterfaceID)
+	return fmt.Sprintf("bridge-child|%d|%d|%d", parent.NamespaceID, parent.Info.IfIndex, it.IfIndex)
 }
 
 func vrfParentKey(it vrfItem) string {
@@ -23,7 +23,7 @@ func vrfParentKey(it vrfItem) string {
 }
 
 func vrfChildKey(parent vrfItem, it types.InterfaceInfo) string {
-	return fmt.Sprintf("vrf-child|%d|%d|%d", parent.NamespaceID, parent.InterfaceID, it.InterfaceID)
+	return fmt.Sprintf("vrf-child|%d|%d|%d", parent.NamespaceID, parent.IfIndex, it.IfIndex)
 }
 
 func netnsParentKey(it types.NamespaceInfo) string {

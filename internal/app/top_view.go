@@ -13,7 +13,6 @@ import (
 	"github.com/msstnk/vxmon/internal/ui"
 )
 
-// top_view.go builds top-pane rows and selection context for Bridge/VRF/NETNS modes.
 type vrfItem struct {
 	NamespaceID   uint64
 	NamespaceName string
@@ -21,7 +20,7 @@ type vrfItem struct {
 	Name          string
 	Label         string
 	TableID       uint32
-	InterfaceID   int
+	IfIndex       int
 	Devs          []types.InterfaceInfo
 }
 
@@ -96,7 +95,7 @@ func buildBridgeItems(ifaces []types.InterfaceInfo, st *store.Store) []bridgeIte
 		}
 		key := bridgeGroupKey(it.NamespaceID, it.MasterName)
 		if _, ok := bridgeInfo[key]; ok {
-			if st.IsBridgePortReferenced(it.NamespaceID, it.InterfaceID) {
+			if st.IsBridgePortReferenced(it.NamespaceID, it.IfIndex) {
 				bound[key] = append(bound[key], it)
 			}
 		}
@@ -105,7 +104,7 @@ func buildBridgeItems(ifaces []types.InterfaceInfo, st *store.Store) []bridgeIte
 	items := make([]bridgeItem, 0, len(bridgeInfo))
 	for key, info := range bridgeInfo {
 		devs := bound[key]
-		sort.Slice(devs, func(i, j int) bool { return devs[i].InterfaceID < devs[j].InterfaceID })
+		sort.Slice(devs, func(i, j int) bool { return devs[i].IfIndex < devs[j].IfIndex })
 		items = append(items, bridgeItem{
 			NamespaceID:   info.NamespaceID,
 			NamespaceName: info.NamespaceName,
@@ -122,7 +121,7 @@ func buildBridgeItems(ifaces []types.InterfaceInfo, st *store.Store) []bridgeIte
 		if items[i].NamespaceName != items[j].NamespaceName {
 			return items[i].NamespaceName < items[j].NamespaceName
 		}
-		return items[i].Info.InterfaceID < items[j].Info.InterfaceID
+		return items[i].Info.IfIndex < items[j].Info.IfIndex
 	})
 	return items
 }
@@ -171,7 +170,7 @@ func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool)
 				continue
 			}
 			if _, ok := vrfMasters[it.MasterName]; ok {
-				if st.IsVRFInterfaceReferenced(it.NamespaceID, it.InterfaceID, detailed) {
+				if st.IsVRFInterfaceReferenced(it.NamespaceID, it.IfIndex, detailed) {
 					bound[it.MasterName] = append(bound[it.MasterName], it)
 				}
 			}
@@ -183,7 +182,7 @@ func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool)
 		}
 		var global []types.InterfaceInfo
 		for _, it := range nsIfaces {
-			if !st.IsVRFInterfaceReferenced(it.NamespaceID, it.InterfaceID, detailed) {
+			if !st.IsVRFInterfaceReferenced(it.NamespaceID, it.IfIndex, detailed) {
 				continue
 			}
 			if it.MasterName == "" {
@@ -194,7 +193,7 @@ func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool)
 				global = append(global, it)
 			}
 		}
-		sort.Slice(global, func(i, j int) bool { return global[i].InterfaceID < global[j].InterfaceID })
+		sort.Slice(global, func(i, j int) bool { return global[i].IfIndex < global[j].IfIndex })
 		items = append(items, vrfItem{
 			NamespaceID:   nsID,
 			NamespaceName: ref.NamespaceName,
@@ -202,7 +201,7 @@ func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool)
 			Name:          constants.DefaultVRFName,
 			Label:         vrfDisplayName(constants.DefaultVRFName, ref.NamespaceName, ref.NamespaceRoot),
 			TableID:       constants.DefaultVRFTableID,
-			InterfaceID:   0,
+			IfIndex:       0,
 			Devs:          global,
 		})
 
@@ -211,12 +210,12 @@ func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool)
 			masterNames = append(masterNames, name)
 		}
 		sort.Slice(masterNames, func(i, j int) bool {
-			return vrfMasters[masterNames[i]].InterfaceID < vrfMasters[masterNames[j]].InterfaceID
+			return vrfMasters[masterNames[i]].IfIndex < vrfMasters[masterNames[j]].IfIndex
 		})
 
 		for _, name := range masterNames {
 			devs := bound[name]
-			sort.Slice(devs, func(i, j int) bool { return devs[i].InterfaceID < devs[j].InterfaceID })
+			sort.Slice(devs, func(i, j int) bool { return devs[i].IfIndex < devs[j].IfIndex })
 			master := vrfMasters[name]
 			items = append(items, vrfItem{
 				NamespaceID:   nsID,
@@ -225,7 +224,7 @@ func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool)
 				Name:          name,
 				Label:         vrfDisplayName(name, ref.NamespaceName, ref.NamespaceRoot),
 				TableID:       master.TableID,
-				InterfaceID:   master.InterfaceID,
+				IfIndex:       master.IfIndex,
 				Devs:          devs,
 			})
 		}
@@ -251,10 +250,6 @@ func matchesVRFRouteTable(vrfTableID uint32, routeTableID uint32) bool {
 		return true
 	}
 	return vrfTableID == constants.DefaultVRFTableID && routeTableID == constants.MainRouteTableID
-}
-
-func (m *Model) netnsItems() []netnsItem {
-	return m.st.Namespaces()
 }
 
 func pickBridge(items []bridgeItem, cursor int) bridgeItem {
@@ -283,7 +278,6 @@ func bridgeIfFilter(items []bridgeItem, cursor int, filterIdx int, mode TopMode)
 		return "", false
 	}
 	bridge := pickBridge(items, cursor)
-	// Validate that the bridge is valid (non-empty) before accessing Devs
 	if bridge.Info.InterfaceName == "" {
 		return "", false
 	}
@@ -510,6 +504,3 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 	}
 }
 
-func (m *Model) selectedVRF() vrfItem {
-	return pickVRF(m.vrfItems(), m.vrfCursor)
-}

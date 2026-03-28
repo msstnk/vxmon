@@ -6,7 +6,6 @@ import (
 	"net"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -43,113 +42,11 @@ type linkListRaw struct {
 	links []netlink.Link
 }
 
-type linkSample struct {
-	rxBytes uint64
-	txBytes uint64
-}
-
-type linkSampleRing struct {
-	buffer []linkSample
-	epochs []time.Time
-	pos    int
-	count  int
-}
-
-func newLinkSampleRing(size int) *linkSampleRing {
-	if size < 2 {
-		size = 2
-	}
-	return &linkSampleRing{
-		buffer: make([]linkSample, size),
-		epochs: make([]time.Time, size),
-	}
-}
-
-func (r *linkSampleRing) push(sample linkSample, at time.Time) {
-	r.buffer[r.pos] = sample
-	r.epochs[r.pos] = at
-	r.pos = (r.pos + 1) % len(r.buffer)
-	if r.count < len(r.buffer) {
-		r.count++
-	}
-}
-
-func (r *linkSampleRing) newest() (linkSample, time.Time, bool) {
-	if r.count == 0 {
-		return linkSample{}, time.Time{}, false
-	}
-	idx := (r.pos - 1 + len(r.buffer)) % len(r.buffer)
-	return r.buffer[idx], r.epochs[idx], true
-}
-
-func (r *linkSampleRing) averageBps(maxWindow time.Duration) (uint64, uint64) {
-	if r.count < 2 {
-		return 0, 0
-	}
-	newestSample, newestAt, ok := r.newest()
-	if !ok {
-		return 0, 0
-	}
-
-	var oldestSample linkSample
-	var oldestAt time.Time
-	found := false
-	for i := 1; i < r.count; i++ {
-		idx := (r.pos - 1 - i + len(r.buffer)) % len(r.buffer)
-		at := r.epochs[idx]
-		if at.IsZero() || !newestAt.After(at) {
-			continue
-		}
-		elapsed := newestAt.Sub(at)
-		if elapsed > maxWindow {
-			break
-		}
-		oldestSample = r.buffer[idx]
-		oldestAt = at
-		found = true
-	}
-	if !found {
-		return 0, 0
-	}
-
-	elapsed := newestAt.Sub(oldestAt).Seconds()
-	if elapsed <= 0 {
-		return 0, 0
-	}
-
-	var rxBps uint64
-	if newestSample.rxBytes >= oldestSample.rxBytes {
-		rxBps = uint64(float64(newestSample.rxBytes-oldestSample.rxBytes) * 8.0 / elapsed)
-	}
-	var txBps uint64
-	if newestSample.txBytes >= oldestSample.txBytes {
-		txBps = uint64(float64(newestSample.txBytes-oldestSample.txBytes) * 8.0 / elapsed)
-	}
-	return rxBps, txBps
-}
-
-func getInterfaceList(ns types.NamespaceInfo, nsHandle int, now time.Time, history map[string]*linkSampleRing) (interfaceInfoRaw, error) {
+func collectInterfaceRaw(ns types.NamespaceInfo, nsHandle int) (interfaceInfoRaw, error) {
 	links, stpByIndex, portByIndex, err := getLinksAndBridgeStates(ns, nsHandle)
 	if err != nil {
 		return interfaceInfoRaw{}, fmt.Errorf("getLinksAndBridgeStates failed: %v", err)
 	}
-
-	if history != nil {
-		for _, link := range links {
-			attrs := link.Attrs()
-			if attrs == nil || attrs.Statistics == nil {
-				continue
-			}
-			key := linkSampleKey(ns.ID, attrs.Index)
-			ring := history[key]
-			if ring == nil {
-				ring = newLinkSampleRing(constants.LinkRateHistoryDepth)
-				history[key] = ring
-			}
-			ring.push(linkSample{rxBytes: attrs.Statistics.RxBytes, txBytes: attrs.Statistics.TxBytes}, now)
-		}
-	}
-
 	return interfaceInfoRaw{
 		links:       links,
 		stpByIndex:  stpByIndex,
@@ -157,7 +54,7 @@ func getInterfaceList(ns types.NamespaceInfo, nsHandle int, now time.Time, histo
 	}, nil
 }
 
-func parseInterfaceList(raw interfaceInfoRaw, ns types.NamespaceInfo, history map[string]*linkSampleRing) ([]types.InterfaceInfo, []types.NamespaceLinkInfo) {
+func parseInterfaceRaw(raw interfaceInfoRaw, ns types.NamespaceInfo, history map[string]*linkSampleRing) ([]types.InterfaceInfo, []types.NamespaceLinkInfo) {
 	indexToName := make(map[int]string, len(raw.links))
 	for _, link := range raw.links {
 		indexToName[link.Attrs().Index] = link.Attrs().Name
@@ -180,7 +77,7 @@ func parseInterfaceList(raw interfaceInfoRaw, ns types.NamespaceInfo, history ma
 			NamespaceName:    ns.ShortName,
 			NamespaceDisplay: ns.DisplayName,
 			NamespaceRoot:    ns.IsRoot,
-			InterfaceID:      attrs.Index,
+			IfIndex:          attrs.Index,
 			InterfaceName:    attrs.Name,
 			IfType:           linkType,
 			ParentID:         attrs.ParentIndex,
@@ -249,7 +146,7 @@ func parseInterfaceList(raw interfaceInfoRaw, ns types.NamespaceInfo, history ma
 		}
 		links = append(links, types.NamespaceLinkInfo{
 			NamespaceID: ns.ID,
-			InterfaceID: attrs.Index,
+			IfIndex:     attrs.Index,
 			Name:        attrs.Name,
 			Type:        linkType,
 			RxBps:       rxBps,
@@ -258,8 +155,8 @@ func parseInterfaceList(raw interfaceInfoRaw, ns types.NamespaceInfo, history ma
 			TxErrors:    attrs.Statistics.TxErrors,
 		})
 	}
-	sort.Slice(results, func(i, j int) bool { return results[i].InterfaceID < results[j].InterfaceID })
-	sort.Slice(links, func(i, j int) bool { return links[i].InterfaceID < links[j].InterfaceID })
+	sort.Slice(results, func(i, j int) bool { return results[i].IfIndex < results[j].IfIndex })
+	sort.Slice(links, func(i, j int) bool { return links[i].IfIndex < links[j].IfIndex })
 	return results, links
 }
 
@@ -365,7 +262,7 @@ func parseNeighList(raw neighRaw, linksRaw linkListRaw, ns types.NamespaceInfo) 
 			IP:               n.IP.String(),
 			MACAddr:          hwAddr,
 			State:            n.State,
-			InterfaceID:      n.LinkIndex,
+			IfIndex:          n.LinkIndex,
 			InterfaceName:    linkNameMap[n.LinkIndex],
 			VLANID:           n.Vlan,
 			VxlanID:          n.VNI,
@@ -374,8 +271,8 @@ func parseNeighList(raw neighRaw, linksRaw linkListRaw, ns types.NamespaceInfo) 
 	}
 
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].InterfaceID != result[j].InterfaceID {
-			return result[i].InterfaceID < result[j].InterfaceID
+		if result[i].IfIndex != result[j].IfIndex {
+			return result[i].IfIndex < result[j].IfIndex
 		}
 		return result[i].IP < result[j].IP
 	})
@@ -423,12 +320,16 @@ func parseRouteList(raw routeRaw, linksRaw linkListRaw, ns types.NamespaceInfo) 
 				nexthops = append(nexthops, types.Nexthop{Gw: gw, Dev: linkNameMap[r.LinkIndex]})
 			}
 
+			prefix, _ := r.Dst.Mask.Size()
+
 			res = append(res, types.RouteEntry{
 				NamespaceID:      ns.ID,
 				NamespaceName:    ns.ShortName,
 				NamespaceDisplay: ns.DisplayName,
 				NamespaceRoot:    ns.IsRoot,
+				IfIndex:          r.LinkIndex,
 				Dst:              dst,
+				Prefix:           prefix,
 				Src:              routeIPString(r.Src),
 				Table:            uint32(r.Table),
 				Priority:         r.Priority,
@@ -583,8 +484,4 @@ func decodeInt(b []byte) (int, bool) {
 		return int(b[0]), true
 	}
 	return 0, false
-}
-
-func linkSampleKey(nsID uint64, ifIndex int) string {
-	return fmt.Sprintf("%d|%d", nsID, ifIndex)
 }

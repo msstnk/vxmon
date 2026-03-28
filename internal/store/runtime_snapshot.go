@@ -5,8 +5,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -14,10 +12,6 @@ import (
 
 	"github.com/msstnk/vxmon/internal/types"
 )
-
-type processSample struct {
-	cpuTicks uint64
-}
 
 type rawProcess struct {
 	namespaceID uint64
@@ -39,93 +33,42 @@ type procScanResult struct {
 	nameCache  map[string]string
 }
 
-func (s *Store) reloadRuntime(now time.Time) error {
-	scan := scanProcfs(true)
-	if err := s.syncNamespacesWithProcScan(&scan); err != nil {
-		return err
-	}
-
-	s.reloadProcesses(now, scan)
-	s.lastRuntime = now
-	return nil
-}
-
 func (s *Store) reloadProcesses(now time.Time, scan procScanResult) {
-	totalCPU := readTotalCPUTime()
-	procs := scan.processes
 	repPID := scan.repPID
+	raw := collectProcessRaw(scan)
 
-	for i := range s.namespaces {
-		s.namespaces[i].SocketUsed = 0
-		s.namespaces[i].TCPInUse = 0
-		s.namespaces[i].UDPInUse = 0
-		s.namespaces[i].TCP6InUse = 0
-		s.namespaces[i].UDP6InUse = 0
-		if state := s.namespacesByID[s.namespaces[i].ID]; state != nil {
-			state.info = s.namespaces[i]
-		}
+	for i := range s.inventory.namespaces {
+		info := s.inventory.namespaces[i]
+		info.SocketUsed = 0
+		info.TCPInUse = 0
+		info.UDPInUse = 0
+		info.TCP6InUse = 0
+		info.UDP6InUse = 0
 
-		pid := repPID[s.namespaces[i].ID]
-		if pid == 0 {
-			continue
-		}
-		used, tcp4, udp4, tcp6, udp6, ok := readSockStats(pid)
-		if !ok {
-			continue
-		}
-		s.namespaces[i].SocketUsed = used
-		s.namespaces[i].TCPInUse = tcp4
-		s.namespaces[i].UDPInUse = udp4
-		s.namespaces[i].TCP6InUse = tcp6
-		s.namespaces[i].UDP6InUse = udp6
-		if state := s.namespacesByID[s.namespaces[i].ID]; state != nil {
-			state.info = s.namespaces[i]
-		}
-	}
-
-	var totalDelta uint64
-	if s.prevTotalCPU > 0 && totalCPU >= s.prevTotalCPU {
-		totalDelta = totalCPU - s.prevTotalCPU
-	}
-	s.prevTotalCPU = totalCPU
-
-	nextProcRows := make(map[uint64][]types.ProcessInfo, len(s.namespaces))
-	for _, proc := range procs {
-		key := processSampleKey(proc.namespaceID, proc.pid)
-		prev := s.processPrev[key]
-
-		loadPct := 0.0
-		if totalDelta > 0 && proc.cpuTicks >= prev.cpuTicks {
-			loadPct = float64(proc.cpuTicks-prev.cpuTicks) / float64(totalDelta) * float64(runtime.NumCPU()) * 100.0
-		}
-
-		nextProcRows[proc.namespaceID] = append(nextProcRows[proc.namespaceID], types.ProcessInfo{
-			NamespaceID: proc.namespaceID,
-			PID:         proc.pid,
-			Exe:         proc.exe,
-			User:        proc.user,
-			LoadPct:     loadPct,
-		})
-		s.processPrev[key] = processSample{
-			cpuTicks: proc.cpuTicks,
-		}
-	}
-
-	for nsID := range nextProcRows {
-		sort.Slice(nextProcRows[nsID], func(i, j int) bool {
-			if nextProcRows[nsID][i].LoadPct != nextProcRows[nsID][j].LoadPct {
-				return nextProcRows[nsID][i].LoadPct > nextProcRows[nsID][j].LoadPct
+		pid := repPID[info.ID]
+		if pid != 0 {
+			used, tcp4, udp4, tcp6, udp6, ok := readSockStats(pid)
+			if ok {
+				info.SocketUsed = used
+				info.TCPInUse = tcp4
+				info.UDPInUse = udp4
+				info.TCP6InUse = tcp6
+				info.UDP6InUse = udp6
 			}
-			return nextProcRows[nsID][i].PID < nextProcRows[nsID][j].PID
-		})
+		}
+		s.inventory.namespaces[i] = info
+		if state := s.inventory.namespacesByID[info.ID]; state != nil {
+			state.info = info
+		}
 	}
-	s.processes = nextProcRows
-	flat := make([]types.ProcessInfo, 0, len(procs))
+	nextProcRows := s.updateProcessHistory(raw)
+	s.runtimeState.processes = nextProcRows
+	flat := make([]types.ProcessInfo, 0, len(raw.processes))
 	for _, rows := range nextProcRows {
 		flat = append(flat, rows...)
 	}
 
-	s.processRecords, s.processMeta, _ = reconcile(s.processRecords, s.processMeta, flat, processKey, processFingerprint, now)
+	s.recordState.processRecords, s.recordState.processMeta, _ = reconcile(s.recordState.processRecords, s.recordState.processMeta, flat, processKey, processFingerprint, 0, now)
 }
 
 func scanProcfs(includeProcessDetails bool) procScanResult {
@@ -246,87 +189,42 @@ func readProcStat(pid int) (uint64, bool) {
 }
 
 func readSockStats(pid int) (uint64, uint64, uint64, uint64, uint64, bool) {
-	used, tcp4, udp4, ok4 := readSockStatFile(filepath.Join("/proc", strconv.Itoa(pid), "net/sockstat"))
-	tcp6, udp6, ok6 := readSockStat6File(filepath.Join("/proc", strconv.Itoa(pid), "net/sockstat6"))
+	var used, tcp4, udp4, tcp6, udp6 uint64
+	ok4 := readNetSockStat(
+		filepath.Join("/proc", strconv.Itoa(pid), "net/sockstat"),
+		map[string]*uint64{"sockets:": &used, "TCP:": &tcp4, "UDP:": &udp4},
+	)
+	ok6 := readNetSockStat(
+		filepath.Join("/proc", strconv.Itoa(pid), "net/sockstat6"),
+		map[string]*uint64{"TCP6:": &tcp6, "UDP6:": &udp6},
+	)
 	if !ok4 && !ok6 {
 		return 0, 0, 0, 0, 0, false
 	}
 	return used, tcp4, udp4, tcp6, udp6, true
 }
 
-func readSockStatFile(path string) (uint64, uint64, uint64, bool) {
+func readNetSockStat(path string, targets map[string]*uint64) bool {
 	file, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, false
+		return false
 	}
 	defer file.Close()
-
-	var used uint64
-	var tcp4 uint64
-	var udp4 uint64
-	var ok bool
-
+	var found bool
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 3 {
 			continue
 		}
-		switch fields[0] {
-		case "sockets:":
-			v, err := strconv.ParseUint(fields[2], 10, 64)
-			if err == nil {
-				used = v
-				ok = true
-			}
-		case "TCP:":
-			v, err := strconv.ParseUint(fields[2], 10, 64)
-			if err == nil {
-				tcp4 = v
-			}
-		case "UDP:":
-			v, err := strconv.ParseUint(fields[2], 10, 64)
-			if err == nil {
-				udp4 = v
+		if ptr, ok := targets[fields[0]]; ok {
+			if v, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
+				*ptr = v
+				found = true
 			}
 		}
 	}
-	return used, tcp4, udp4, ok
-}
-
-func readSockStat6File(path string) (uint64, uint64, bool) {
-	file, err := os.Open(path)
-	if err != nil {
-		return 0, 0, false
-	}
-	defer file.Close()
-
-	var tcp6 uint64
-	var udp6 uint64
-	var ok bool
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 3 {
-			continue
-		}
-		switch fields[0] {
-		case "TCP6:":
-			v, err := strconv.ParseUint(fields[2], 10, 64)
-			if err == nil {
-				tcp6 = v
-				ok = true
-			}
-		case "UDP6:":
-			v, err := strconv.ParseUint(fields[2], 10, 64)
-			if err == nil {
-				udp6 = v
-				ok = true
-			}
-		}
-	}
-	return tcp6, udp6, ok
+	return found
 }
 
 func readTotalCPUTime() uint64 {
@@ -353,8 +251,4 @@ func readTotalCPUTime() uint64 {
 		total += v
 	}
 	return total
-}
-
-func processSampleKey(nsID uint64, pid int) string {
-	return strconv.FormatUint(nsID, 10) + "|" + strconv.Itoa(pid)
 }
