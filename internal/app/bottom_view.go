@@ -16,7 +16,6 @@ import (
 	"github.com/msstnk/vxmon/internal/ui"
 )
 
-// bottom_view.go builds the bottom pane tables for FDB, Neigh, Route, Process, and Link modes.
 func errorRows(text string) []ui.ListRow {
 	style := lipgloss.NewStyle().Foreground(ui.ColorWarn).Bold(true)
 	return []ui.ListRow{{Text: text, Style: style}}
@@ -43,7 +42,7 @@ func renderTableRowsWithSpecs(headers []string, tableRows [][]string, specs []ui
 	return header, rows
 }
 
-func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cursorIdx int) {
+func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow) {
 	base := lipgloss.NewStyle().Foreground(lipgloss.Color(ui.ColorBaseColor))
 	now := m.fadeClock.UnixNano()
 
@@ -51,7 +50,7 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 	case m.topMode == TopBridge && m.botMode == BottomFDB:
 		bridge := pickBridge(data.bridges, m.bridgeCursor)
 		if bridge.Info.InterfaceName == "" {
-			return "", nil, 0
+			return "", nil
 		}
 		selectedPort, portFilterOn := bridgeIfFilter(data.bridges, m.bridgeCursor, m.bridgeDevFilterIdx, m.topMode)
 
@@ -211,7 +210,7 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 			styles = append(styles, st)
 		}
 		header, rows = renderTableRows(headers, tableRows, styles, m.width-6)
-		return header, rows, m.botCursor
+		return header, rows
 
 	case m.topMode == TopVRF && m.botMode == BottomNeigh:
 		vrf := pickVRF(data.vrfs, m.vrfCursor)
@@ -328,7 +327,7 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 			styles = append(styles, st)
 		}
 		header, rows = renderTableRows(headers, tableRows, styles, m.width-6)
-		return header, rows, m.botCursor
+		return header, rows
 
 	case m.topMode == TopVRF && m.botMode == BottomRoute:
 		vrf := pickVRF(data.vrfs, m.vrfCursor)
@@ -348,7 +347,7 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 		type routeItem struct {
 			rr     store.Record[types.RouteEntry]
 			nhs    []types.Nexthop
-			fam    int
+			family int
 			minDev string
 		}
 		var items []routeItem
@@ -361,7 +360,11 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 			if !matchesVRFRouteTable(vrf.TableID, r.Table) {
 				continue
 			}
-			if (!m.detailed && (r.Type == unix.RTN_MULTICAST || r.Type == unix.RTN_BROADCAST)) || r.Type == unix.RTN_ANYCAST {
+			if !m.detailed &&
+				(r.Type == unix.RTN_MULTICAST ||
+					r.Type == unix.RTN_BROADCAST ||
+					r.Type == unix.RTN_ANYCAST ||
+					(r.Protocol == unix.RTPROT_KERNEL && helpers.IsLinkLocalIP(r.Dst))) {
 				continue
 			}
 
@@ -384,19 +387,30 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 			items = append(items, routeItem{
 				rr:     rr,
 				nhs:    nhs,
-				fam:    helpers.RouteFamilyOrder(r.Dst, nhs[0].Gw),
+				family: helpers.RouteFamilyOrder(r.Dst, nhs[0].Gw),
 				minDev: nhs[0].Dev,
 			})
 		}
 
 		sort.Slice(items, func(i, j int) bool {
 			a, b := items[i], items[j]
-			if a.fam != b.fam {
-				return a.fam < b.fam
+			// Always default routes to the top regardless of IP family
+			if (a.rr.Val.Prefix == 0 || b.rr.Val.Prefix == 0) && a.rr.Val.Prefix != b.rr.Val.Prefix {
+				return a.rr.Val.Prefix < b.rr.Val.Prefix
+			}
+			if a.family != b.family {
+				return a.family < b.family
+			}
+			if a.rr.Val.Prefix != b.rr.Val.Prefix {
+				return a.rr.Val.Prefix < b.rr.Val.Prefix
+			}
+			if a.rr.Val.IfIndex != b.rr.Val.IfIndex {
+				return a.rr.Val.IfIndex < b.rr.Val.IfIndex
 			}
 			if a.rr.Val.Dst != b.rr.Val.Dst {
 				return a.rr.Val.Dst < b.rr.Val.Dst
 			}
+
 			return a.minDev < b.minDev
 		})
 
@@ -418,7 +432,7 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 					baseP = "S "
 				case unix.RTPROT_KERNEL:
 					baseP = "L "
-				case 11, 17, 186:
+				case unix.RTPROT_ZEBRA, unix.RTPROT_BIRD, unix.RTPROT_BGP:
 					baseP = "B "
 				}
 				if isECMP && baseP != "  " {
@@ -443,21 +457,26 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 					dstStr = ""
 					typeStr = "  "
 				}
-				tableRows = append(tableRows, []string{typeStr, dstStr, nh.Gw, nh.Dev})
+				tableRows = append(tableRows, []string{
+					typeStr,
+					dstStr,
+					nh.Gw,
+					nh.Dev,
+				})
 				styles = append(styles, st)
 			}
 		}
 
 		header, rows = renderTableRowsWithSpecs(headers, tableRows, specs, styles, m.width-6)
-		return header, rows, m.botCursor
+		return header, rows
 
 	case m.topMode == TopNETNS && m.botMode == BottomProcess:
 		ns := pickNETNS(data.netns, m.netnsCursor)
 		if ns.DisplayName == "" {
-			return "", nil, 0
+			return "", nil
 		}
 		if ns.PermissionErr != "" {
-			return "", errorRows("Error: " + ns.PermissionErr), 0
+			return "", errorRows("Error: " + ns.PermissionErr)
 		}
 
 		headers := []string{"PID", "COMMAND", "USER", "LOAD(%)"}
@@ -484,15 +503,15 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 			styles = append(styles, ui.FadeStyle(proc.Meta, now, base))
 		}
 		header, rows = renderTableRowsWithSpecs(headers, tableRows, specs, styles, m.width-6)
-		return header, rows, m.botCursor
+		return header, rows
 
 	case m.topMode == TopNETNS && m.botMode == BottomLink:
 		ns := pickNETNS(data.netns, m.netnsCursor)
 		if ns.DisplayName == "" {
-			return "", nil, 0
+			return "", nil
 		}
 		if ns.PermissionErr != "" {
-			return "", errorRows("Error: " + ns.PermissionErr), 0
+			return "", errorRows("Error: " + ns.PermissionErr)
 		}
 
 		headers := []string{"NAME", "TYPE", "RX", "TX", "RX-ERR", "TX-ERR"}
@@ -519,8 +538,8 @@ func (m *Model) buildBottom(data topItems) (header string, rows []ui.ListRow, cu
 			styles = append(styles, ui.FadeStyle(link.Meta, now, base))
 		}
 		header, rows = renderTableRowsWithSpecs(headers, tableRows, specs, styles, m.width-6)
-		return header, rows, m.botCursor
+		return header, rows
 	}
 
-	return "", nil, 0
+	return "", nil
 }

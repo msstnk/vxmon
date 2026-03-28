@@ -18,11 +18,14 @@ const (
 
 type nlReloadMask uint8
 
+const fullReloadMask nlReloadMask = (1 << nlReloadInterfaces) | (1 << nlReloadNeighAndFDB) | (1 << nlReloadRoutes)
+
 type storeEventKind uint8
 
 const (
 	storeEventFetchLatest storeEventKind = iota
 	storeEventNamespaceSync
+	storeEventNamespaceSubscribed
 	storeEventNeigh
 	storeEventRoute
 	storeEventLink
@@ -48,7 +51,9 @@ func (s *Store) enqueueEvent(ev storeEvent) {
 	select {
 	case s.eventCh <- ev:
 	default:
-		// Keep the latest view; dropping stale events is preferable to blocking listeners.
+		// Keep the latest view
+		debuglog.Infof("store.enqueueEvent: event dropped kind=%v, namespaceID=%d, at=%v",
+			ev.kind, ev.namespaceID, ev.at)
 	}
 }
 
@@ -58,6 +63,8 @@ func (s *Store) runLoop(ctx context.Context, send func(any)) {
 		switch x := msg.(type) {
 		case NamespaceSyncMsg:
 			s.enqueueEvent(storeEvent{kind: storeEventNamespaceSync, at: x.At})
+		case NamespaceSubscribedMsg:
+			s.enqueueEvent(storeEvent{kind: storeEventNamespaceSubscribed, namespaceID: x.NamespaceID, at: x.At})
 		case NeighNLMsg:
 			s.enqueueEvent(storeEvent{kind: storeEventNeigh, namespaceID: x.Namespace.ID, at: x.At})
 		case RouteNLMsg:
@@ -96,197 +103,238 @@ func (s *Store) handleEvent(ev storeEvent) eventLoopMsg {
 	}
 	switch ev.kind {
 	case storeEventFetchLatest:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		if err := s.ReloadAll(ev.at); err != nil {
-			debuglog.Errorf("store.handleEvent fetch failed: %v", err)
-			return noupdate
-		}
-		if s.metaRevisionLocked() != before {
-			return updated
-		}
-		return periodicUpdate
-
+		return s.applyFetchLatest(ev.at)
 	case storeEventNamespaceSync:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		if err := s.syncNamespaces(); err != nil {
-			debuglog.Errorf("store.handleEvent namespace sync failed: %v", err)
-			return noupdate
-		}
-		if s.metaRevisionLocked() != before {
-			return updated
-		}
-		return noupdate
+		return s.applyNamespaceSync(ev.at)
+	case storeEventNamespaceSubscribed:
+		return s.applyNamespaceSubscribedEvent(ev.namespaceID, ev.at)
 	case storeEventNeigh:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		s.scheduleNamespaceReloadLocked(nlReloadNeighAndFDB, ev.namespaceID, ev.at)
-		s.scheduleNamespaceReloadLocked(nlReloadInterfaces, ev.namespaceID, ev.at)
-		s.runScheduledNamespaceReloadLocked(ev.at)
-		if s.metaRevisionLocked() != before {
-			return updated
-		}
-		return noupdate
+		return s.applyNeighEvent(ev.namespaceID, ev.at)
 	case storeEventRoute:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		s.scheduleNamespaceReloadLocked(nlReloadRoutes, ev.namespaceID, ev.at)
-		s.scheduleNamespaceReloadLocked(nlReloadInterfaces, ev.namespaceID, ev.at)
-		s.runScheduledNamespaceReloadLocked(ev.at)
-		if s.metaRevisionLocked() != before {
-			return updated
-		}
-		return noupdate
+		return s.applyRouteEvent(ev.namespaceID, ev.at)
 	case storeEventLink:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		s.scheduleNamespaceReloadLocked(nlReloadInterfaces, ev.namespaceID, ev.at)
-		s.runScheduledNamespaceReloadLocked(ev.at)
-		if s.metaRevisionLocked() != before {
-			return updated
-		}
-		return noupdate
+		return s.applyLinkEvent(ev.namespaceID, ev.at)
 	case storeEventFadeTick:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		s.runScheduledNamespaceReloadLocked(ev.at)
-		_, _ = s.Advance(ev.at)
-		if s.metaRevisionLocked() != before {
-			return periodicUpdate
-		}
-		return noupdate
+		return s.applyFadeTick(ev.at)
 	case storeEventScheduledReload:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		before := s.metaRevisionLocked()
-		s.runScheduledNamespaceReloadLocked(ev.at)
-		if err := s.syncNamespaces(); err != nil {
-			debuglog.Errorf("store.handleEvent scheduled namespace sync failed: %v", err)
-			return noupdate
-		}
-		_, _ = s.Advance(ev.at)
-		if s.metaRevisionLocked() != before {
-			return updated
-		}
-		return noupdate
+		return s.applyScheduledReload(ev.at)
 	default:
 		return noupdate
 	}
 }
 
-func (s *Store) runScheduledNamespaceReloadLocked(now time.Time) bool {
-	changed := false
-	for namespaceID := range s.nsReloadPending {
-		dueAt := s.namespaceReloadDueAt(namespaceID)
-		if dueAt.After(now) {
-			continue
+func (s *Store) applyFetchLatest(at time.Time) eventLoopMsg {
+	return s.applyLockedUpdate(at, periodicUpdate, "store.applyFetchLatest failed", func() error {
+		s.cancelScheduledNamespaceReloadLocked()
+		if err := s.ReloadAll(at); err != nil {
+			return err
 		}
-		s.namespaceReloadSetPending(namespaceID, false)
-		dirty := s.namespaceReloadTakeDirty(namespaceID)
-		s.namespaceReloadClearDueAt(namespaceID)
-		if dirty == 0 {
-			continue
-		}
-		if dirty&nlReloadMaskForKind(nlReloadInterfaces) != 0 {
-			s.applyNamespaceReloadLocked(nlReloadInterfaces, namespaceID, now)
-			changed = true
-		}
-		if dirty&nlReloadMaskForKind(nlReloadNeighAndFDB) != 0 {
-			s.applyNamespaceReloadLocked(nlReloadNeighAndFDB, namespaceID, now)
-			changed = true
-		}
-		if dirty&nlReloadMaskForKind(nlReloadRoutes) != 0 {
-			s.applyNamespaceReloadLocked(nlReloadRoutes, namespaceID, now)
-			changed = true
-		}
-		s.namespaceReloadSetRefreshedAt(namespaceID, now)
-	}
-	return changed
+		s.markNamespaceReloadRefreshedAllLocked(at)
+		return nil
+	})
 }
 
-func (s *Store) scheduleNamespaceReloadLocked(kind nlReloadKind, namespaceID uint64, at time.Time) {
-	s.namespaceReloadAddDirty(namespaceID, kind)
-	dueAt := at.Add(constants.NLMsgThrottleInterval)
-	last := s.namespaceReloadRefreshedAt(namespaceID)
-	if !last.IsZero() {
-		minDueAt := last.Add(constants.NLMsgThrottleInterval)
-		if minDueAt.After(dueAt) {
-			dueAt = minDueAt
+func (s *Store) applyNamespaceSync(at time.Time) eventLoopMsg {
+	return s.applyLockedUpdate(at, noupdate, "store.applyNamespaceSync failed", func() error {
+		return s.syncNamespaces()
+	})
+}
+
+func (s *Store) applyNamespaceSubscribedEvent(namespaceID uint64, at time.Time) eventLoopMsg {
+	return s.applyNamespaceReloadEvent(namespaceID, fullReloadMask, at)
+}
+
+func (s *Store) applyNamespaceReloadEvent(namespaceID uint64, mask nlReloadMask, at time.Time) eventLoopMsg {
+	return s.applyLockedUpdate(at, noupdate, "", func() error {
+		s.collectNamespaceReloadLocked(namespaceID, mask, at)
+		s.applyDueNamespaceReloadLocked(at)
+		return nil
+	})
+}
+
+func (s *Store) applyNeighEvent(namespaceID uint64, at time.Time) eventLoopMsg {
+	return s.applyNamespaceReloadEvent(namespaceID, nlReloadMaskForKind(nlReloadNeighAndFDB), at)
+}
+
+func (s *Store) applyRouteEvent(namespaceID uint64, at time.Time) eventLoopMsg {
+	return s.applyNamespaceReloadEvent(namespaceID, nlReloadMaskForKind(nlReloadRoutes), at)
+}
+
+func (s *Store) applyLinkEvent(namespaceID uint64, at time.Time) eventLoopMsg {
+	return s.applyNamespaceReloadEvent(namespaceID, fullReloadMask, at)
+}
+
+func (s *Store) applyFadeTick(at time.Time) eventLoopMsg {
+	return s.applyLockedUpdate(at, noupdate, "", func() error {
+		s.applyDueNamespaceReloadLocked(at)
+		return nil
+	})
+}
+
+func (s *Store) applyScheduledReload(at time.Time) eventLoopMsg {
+	return s.applyLockedUpdate(at, noupdate, "store.applyScheduledReload sync failed", func() error {
+		if err := s.syncNamespaces(); err != nil {
+			return err
+		}
+		s.applyDueNamespaceReloadLocked(at)
+		return nil
+	})
+}
+
+func (s *Store) applyLockedUpdate(at time.Time, onNoChange eventLoopMsg, errLog string, fn func() error) eventLoopMsg {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := s.metaRevisionLocked()
+	if fn != nil {
+		if err := fn(); err != nil {
+			if errLog != "" {
+				debuglog.Errorf("%s: %v", errLog, err)
+			}
+			return noupdate
 		}
 	}
-	s.namespaceReloadSetDueAt(namespaceID, dueAt)
-	if !s.namespaceReloadPending(namespaceID) {
-		s.namespaceReloadSetPending(namespaceID, true)
-		time.AfterFunc(time.Until(dueAt), func() {
-			s.eventCh <- storeEvent{
+	_, _ = s.Advance(at)
+	if s.metaRevisionLocked() != before {
+		return updated
+	}
+	return onNoChange
+}
+
+// applyDueNamespaceReloadLocked processes all due namespace reloads.
+// It releases s.mu during netlink I/O so UI reads are not blocked, then reacquires it.
+// Callers must hold s.mu on entry; the lock is held again on return.
+func (s *Store) applyDueNamespaceReloadLocked(now time.Time) {
+	type work struct {
+		namespaceID uint64
+		dirty       nlReloadMask
+		state       *namespaceState
+	}
+	var pending []work
+	for namespaceID, e := range s.reloadState.ns {
+		if !e.pending || e.dueAt.After(now) {
+			continue
+		}
+		e.pending = false
+		dirty := e.dirty
+		e.dirty = 0
+		e.dueAt = time.Time{}
+		state := s.namespaceState(namespaceID)
+		if dirty == 0 || state == nil {
+			continue
+		}
+		pending = append(pending, work{namespaceID, dirty, state})
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	// Release lock during netlink I/O to allow concurrent UI reads.
+	s.mu.Unlock()
+	type result struct {
+		work
+		links    linkListRaw
+		linkOK   bool
+		ifaces   interfaceInfoRaw
+		neighFDB namespaceNeighFDBSnapshot
+		routes   namespaceRouteSnapshot
+	}
+	results := make([]result, len(pending))
+	for i, w := range pending {
+		r := result{work: w}
+		if w.dirty&(nlReloadMaskForKind(nlReloadNeighAndFDB)|nlReloadMaskForKind(nlReloadRoutes)) != 0 {
+			links, err := getLinkListRaw(w.state.handle)
+			if err == nil {
+				r.links = links
+				r.linkOK = true
+			} else {
+				debuglog.Errorf("store.applyDueNamespaceReloadLocked links namespace=%d failed: %v", w.state.info.ID, err)
+			}
+		}
+		if w.dirty&nlReloadMaskForKind(nlReloadInterfaces) != 0 {
+			r.ifaces, _ = s.collectNamespaceInterfaces(w.state)
+		}
+		if r.linkOK && w.dirty&nlReloadMaskForKind(nlReloadNeighAndFDB) != 0 {
+			r.neighFDB, _ = s.collectNamespaceNeighAndFDB(w.state, r.links)
+		}
+		if r.linkOK && w.dirty&nlReloadMaskForKind(nlReloadRoutes) != 0 {
+			r.routes, _ = s.collectNamespaceRoutes(w.state, r.links)
+		}
+		results[i] = r
+	}
+	s.mu.Lock()
+
+	for _, r := range results {
+		// Re-check in case the namespace was removed while we were collecting.
+		state := s.namespaceState(r.namespaceID)
+		if state == nil {
+			continue
+		}
+		if r.dirty&nlReloadMaskForKind(nlReloadInterfaces) != 0 {
+			s.applyNamespaceInterfaces(state, r.ifaces, now)
+		}
+		if r.dirty&nlReloadMaskForKind(nlReloadNeighAndFDB) != 0 {
+			s.applyNamespaceNeighAndFDB(state, r.neighFDB, now)
+		}
+		if r.dirty&nlReloadMaskForKind(nlReloadRoutes) != 0 {
+			s.applyNamespaceRoutes(state, r.routes, now)
+		}
+		if e := s.reloadState.ns[r.namespaceID]; e != nil {
+			e.refreshedAt = now
+		}
+	}
+	s.rebuildInterfaceIndexes()
+	s.rebuildReferenceMaps()
+}
+
+func (s *Store) collectNamespaceReloadLocked(namespaceID uint64, mask nlReloadMask, at time.Time) {
+	if mask == 0 {
+		return
+	}
+	e := s.reloadState.ns[namespaceID]
+	if e == nil {
+		e = &nsReloadEntry{}
+		s.reloadState.ns[namespaceID] = e
+	}
+	e.dirty |= mask
+	dueAt := at.Add(constants.NLMsgAggregationTimer)
+	if !e.refreshedAt.IsZero() && at.Sub(e.refreshedAt) < constants.NLMsgThrottleInterval {
+		dueAt = e.refreshedAt.Add(constants.NLMsgThrottleInterval)
+	}
+	if !e.dueAt.IsZero() && e.dueAt.Before(dueAt) {
+		dueAt = e.dueAt
+	}
+	e.dueAt = dueAt
+	if !e.pending {
+		e.pending = true
+		wait := time.Until(dueAt)
+		if wait < 0 {
+			wait = 0
+		}
+		time.AfterFunc(wait, func() {
+			s.enqueueEvent(storeEvent{
 				kind:        storeEventScheduledReload,
 				namespaceID: namespaceID,
 				at:          dueAt.Add(time.Nanosecond),
-			}
+			})
 		})
 	}
 }
 
-func (s *Store) applyNamespaceReloadLocked(kind nlReloadKind, namespaceID uint64, at time.Time) {
-	switch kind {
-	case nlReloadNeighAndFDB:
-		_ = s.ReloadNamespaceNeighAndFDB(namespaceID, at)
-	case nlReloadRoutes:
-		_ = s.ReloadNamespaceRoutes(namespaceID, at)
-	default:
-		_ = s.ReloadNamespaceInterfaces(namespaceID, at)
+func (s *Store) markNamespaceReloadRefreshedAllLocked(at time.Time) {
+	for _, ns := range s.inventory.namespaces {
+		e := s.reloadState.ns[ns.ID]
+		if e == nil {
+			e = &nsReloadEntry{}
+			s.reloadState.ns[ns.ID] = e
+		}
+		e.refreshedAt = at
 	}
+}
+
+func (s *Store) cancelScheduledNamespaceReloadLocked() {
+	s.reloadState.ns = map[uint64]*nsReloadEntry{}
 }
 
 func nlReloadMaskForKind(kind nlReloadKind) nlReloadMask {
 	return 1 << kind
-}
-
-func (s *Store) namespaceReloadRefreshedAt(namespaceID uint64) time.Time {
-	return s.nsReloadRefreshedAt[namespaceID]
-}
-
-func (s *Store) namespaceReloadSetRefreshedAt(namespaceID uint64, at time.Time) {
-	s.nsReloadRefreshedAt[namespaceID] = at
-}
-
-func (s *Store) namespaceReloadDueAt(namespaceID uint64) time.Time {
-	return s.nsReloadDueAt[namespaceID]
-}
-
-func (s *Store) namespaceReloadPending(namespaceID uint64) bool {
-	return s.nsReloadPending[namespaceID]
-}
-
-func (s *Store) namespaceReloadSetPending(namespaceID uint64, pending bool) {
-	if pending {
-		s.nsReloadPending[namespaceID] = true
-		return
-	}
-	delete(s.nsReloadPending, namespaceID)
-}
-
-func (s *Store) namespaceReloadSetDueAt(namespaceID uint64, at time.Time) {
-	s.nsReloadDueAt[namespaceID] = at
-}
-
-func (s *Store) namespaceReloadClearDueAt(namespaceID uint64) {
-	delete(s.nsReloadDueAt, namespaceID)
-}
-
-func (s *Store) namespaceReloadAddDirty(namespaceID uint64, kind nlReloadKind) {
-	s.nsReloadDirty[namespaceID] |= nlReloadMaskForKind(kind)
-}
-
-func (s *Store) namespaceReloadTakeDirty(namespaceID uint64) nlReloadMask {
-	dirty := s.nsReloadDirty[namespaceID]
-	delete(s.nsReloadDirty, namespaceID)
-	return dirty
 }

@@ -14,7 +14,6 @@ import (
 	"github.com/msstnk/vxmon/internal/ui"
 )
 
-// model.go owns the Bubble Tea update loop, input handling, and viewport state.
 type TopMode string
 
 type BottomMode string
@@ -33,7 +32,6 @@ const (
 
 var topModeCycle = []TopMode{TopBridge, TopVRF, TopNETNS}
 
-// Model is created in cmd/vxmon/main and then owned by Bubble Tea's single update loop.
 type Model struct {
 	st                 *store.Store
 	requestFetchLatest func(time.Time)
@@ -67,7 +65,6 @@ type Model struct {
 	topCursorRowIdx  int
 	bottomHeaderStr  string
 	bottomRows       []ui.ListRow
-	bottomCursorIdx  int
 	detailed         bool
 	showHelp         bool
 	helpDirty        bool
@@ -275,16 +272,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		paneRenderChanged := false
 
 		switch x.String() {
-		case "q", "ctrl+c":
+		case "q", "Q", "ctrl+c":
 			return m, tea.Quit
-		case "h", "?":
+		case "h", "H", "?":
 			m.showHelp = true
 			m.helpDirty = false
 			return m, nil
 		case "tab":
 			m.focusTop = !m.focusTop
 			paneRenderChanged = true
-		case "d":
+		case "d", "D":
 			m.detailed = !m.detailed
 			topDataChanged = true
 		case "t", "T":
@@ -466,7 +463,7 @@ func (m *Model) moveTopCursor(delta int) {
 		m.bridgeCursor = clamp(m.bridgeCursor+delta, 0, len(bridges)-1)
 		m.bridgeDevFilterIdx = -1
 	case TopNETNS:
-		netnsItems := m.netnsItems()
+		netnsItems := m.st.Namespaces()
 		m.netnsCursor = clamp(m.netnsCursor+delta, 0, len(netnsItems)-1)
 	default:
 		vrfs := m.vrfItems()
@@ -495,7 +492,7 @@ func (m *Model) moveTopBoundary(last bool) {
 		}
 		m.bridgeDevFilterIdx = -1
 	case TopNETNS:
-		items := m.netnsItems()
+		items := m.st.Namespaces()
 		if last {
 			m.netnsCursor = max(0, len(items)-1)
 		} else {
@@ -537,23 +534,8 @@ func (m *Model) clearTopFilter() bool {
 }
 
 func (m *Model) refreshAll() {
-	visibleTop, visibleBottom := m.layout()
-	data := m.currentTopItems()
-	m.syncTopParentMeta(data)
-	m.topVisible = visibleTop
-	m.topRows, m.topCursorRowIdx = m.buildTopRows(visibleTop, data)
-	if visibleTop > 0 {
-		m.topViewport = m.adjustTopViewport(visibleTop, data)
-	}
-	if m.topViewport < 0 {
-		m.topViewport = 0
-	}
-	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom(data)
-	m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
 	m.rebuildHeaderCache()
-	m.renderTopPane(visibleTop)
-	m.renderBottomPane(visibleBottom)
-	m.rebuildBaseCache()
+	m.refreshTopAndBottom()
 }
 
 func (m *Model) refreshTopAndBottom() {
@@ -568,7 +550,7 @@ func (m *Model) refreshTopAndBottom() {
 	if m.topViewport < 0 {
 		m.topViewport = 0
 	}
-	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom(data)
+	m.bottomHeaderStr, m.bottomRows = m.buildBottom(data)
 	m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
 	m.renderTopPane(visibleTop)
 	m.renderBottomPane(visibleBottom)
@@ -577,7 +559,7 @@ func (m *Model) refreshTopAndBottom() {
 
 func (m *Model) refreshBottomOnly() {
 	_, visibleBottom := m.layout()
-	m.bottomHeaderStr, m.bottomRows, m.bottomCursorIdx = m.buildBottom(m.currentTopItems())
+	m.bottomHeaderStr, m.bottomRows = m.buildBottom(m.currentTopItems())
 	m.botCursor = clamp(m.botCursor, 0, len(m.bottomRows)-1)
 	m.renderBottomPane(visibleBottom)
 	m.rebuildBaseCache()
@@ -769,7 +751,7 @@ func moveFilterIndex(current int, total int, delta int) int {
 }
 
 func (m *Model) moveVrfDevFilter(delta int) {
-	displayDevs := m.selectedVRF().Devs
+	displayDevs := pickVRF(m.vrfItems(), m.vrfCursor).Devs
 	m.vrfDevFilterIdx = moveFilterIndex(m.vrfDevFilterIdx, len(displayDevs), delta)
 }
 

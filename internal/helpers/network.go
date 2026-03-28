@@ -13,9 +13,17 @@ import (
 func IsMulticastIP(s string) bool {
 	addr, err := netip.ParseAddr(strings.TrimSpace(s))
 	if err != nil {
-		return strings.HasPrefix(s, "ff") || strings.HasPrefix(s, "FF") || strings.HasPrefix(s, "224.")
+		return strings.HasPrefix(s, "ff") || strings.HasPrefix(s, "224.")
 	}
 	return addr.IsMulticast()
+}
+
+func IsLinkLocalIP(s string) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil {
+		return strings.HasPrefix(s, "fe80::") || strings.HasPrefix(s, "169.254.")
+	}
+	return addr.IsLinkLocalUnicast()
 }
 
 func IpFamilyOrderFromAddrStr(s string) int {

@@ -10,8 +10,24 @@ import (
 )
 
 // keys.go generates stable record keys and fingerprints for reconcile().
+func recordPrefix(nsID uint64) string {
+	return strconv.FormatUint(nsID, 10) + "|"
+}
+
+func recordNamespaceID(key string) (uint64, bool) {
+	head, _, ok := strings.Cut(key, "|")
+	if !ok {
+		return 0, false
+	}
+	nsID, err := strconv.ParseUint(head, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return nsID, true
+}
+
 func neighKey(n types.NeighEntry) string {
-	return strconv.FormatUint(n.NamespaceID, 10) + "|" + fmt.Sprintf("%d|%d|%d|%s", n.InterfaceID, n.VLANID, n.VxlanID, n.IP)
+	return recordPrefix(n.NamespaceID) + fmt.Sprintf("%d|%d|%d|%s", n.IfIndex, n.VLANID, n.VxlanID, n.IP)
 }
 
 func neighFingerprint(n types.NeighEntry) string {
@@ -19,7 +35,7 @@ func neighFingerprint(n types.NeighEntry) string {
 }
 
 func fdbKey(f types.FdbEntry) string {
-	return strconv.FormatUint(f.NamespaceID, 10) + "|" + fmt.Sprintf("%d|%d|%d|%s|%d|%s", f.BridgeID, f.PortID, f.VLANID, f.MACAddr, f.VxlanID, f.RemoteVTEP)
+	return recordPrefix(f.NamespaceID) + fmt.Sprintf("%d|%d|%d|%s|%d|%s", f.BridgeID, f.PortID, f.VLANID, f.MACAddr, f.VxlanID, f.RemoteVTEP)
 }
 
 func fdbFingerprint(f types.FdbEntry) string {
@@ -27,7 +43,7 @@ func fdbFingerprint(f types.FdbEntry) string {
 }
 
 func routeKey(r types.RouteEntry) string {
-	return strconv.FormatUint(r.NamespaceID, 10) + "|" + fmt.Sprintf("%d|%s|%d|%d|%d|%d|%s", r.Table, r.Dst, r.Priority, r.Type, r.Protocol, r.Scope, r.Src)
+	return recordPrefix(r.NamespaceID) + fmt.Sprintf("%d|%d|%s|%d|%d|%d|%d|%d|%s", r.Table, r.IfIndex, r.Dst, r.Prefix, r.Priority, r.Type, r.Protocol, r.Scope, r.Src)
 }
 
 func routeFingerprint(r types.RouteEntry) string {
@@ -40,7 +56,7 @@ func routeFingerprint(r types.RouteEntry) string {
 }
 
 func processKey(p types.ProcessInfo) string {
-	return strconv.FormatUint(p.NamespaceID, 10) + "|" + strconv.Itoa(p.PID)
+	return recordPrefix(p.NamespaceID) + strconv.Itoa(p.PID)
 }
 
 func processFingerprint(p types.ProcessInfo) string {
@@ -48,7 +64,7 @@ func processFingerprint(p types.ProcessInfo) string {
 }
 
 func linkKey(l types.NamespaceLinkInfo) string {
-	return strconv.FormatUint(l.NamespaceID, 10) + "|" + strconv.Itoa(l.InterfaceID)
+	return recordPrefix(l.NamespaceID) + strconv.Itoa(l.IfIndex)
 }
 
 func linkFingerprint(l types.NamespaceLinkInfo) string {

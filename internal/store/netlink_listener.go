@@ -27,8 +27,8 @@ func (s *Store) ListenNetlink(ctx context.Context, send func(any)) {
 		debuglog.Tracef("store.ListenNetlink resync")
 
 		s.mu.RLock()
-		targets := make([]types.NamespaceInfo, len(s.namespaces))
-		copy(targets, s.namespaces)
+		targets := make([]types.NamespaceInfo, len(s.inventory.namespaces))
+		copy(targets, s.inventory.namespaces)
 		s.mu.RUnlock()
 
 		current := make(map[uint64]types.NamespaceInfo, len(targets))
@@ -69,6 +69,7 @@ func (s *Store) ListenNetlink(ctx context.Context, send func(any)) {
 			}
 			subs[target.ID] = &namespaceSubscription{id: target.ID, done: done}
 			debuglog.Infof("store.ListenNetlink subscribe namespace=%d path=%s", target.ID, target.MountPoint)
+			send(NamespaceSubscribedMsg{NamespaceID: target.ID, At: time.Now()})
 		}
 	}
 
@@ -131,13 +132,22 @@ func startNamespaceSubscription(ctx context.Context, target types.NamespaceInfo,
 				return
 			case <-done:
 				return
-			case u := <-neighCh:
+			case u, ok := <-neighCh:
+				if !ok {
+					return
+				}
 				debuglog.Tracef("store.ListenNetlink neigh namespace=%d type=%d", target.ID, u.Type)
 				send(NeighNLMsg{Namespace: nsInfo, Update: u, At: time.Now()})
-			case u := <-routeCh:
+			case u, ok := <-routeCh:
+				if !ok {
+					return
+				}
 				debuglog.Tracef("store.ListenNetlink route namespace=%d type=%d", target.ID, u.Type)
 				send(RouteNLMsg{Namespace: nsInfo, Update: u, At: time.Now()})
-			case u := <-linkCh:
+			case u, ok := <-linkCh:
+				if !ok {
+					return
+				}
 				debuglog.Tracef("store.ListenNetlink link namespace=%d type=%d", target.ID, u.Type)
 				send(LinkNLMsg{Namespace: nsInfo, Update: u, At: time.Now()})
 			}

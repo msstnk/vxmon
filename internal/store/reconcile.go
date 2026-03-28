@@ -1,46 +1,19 @@
 package store
 
 import (
-	"strconv"
 	"strings"
 	"time"
 )
 
 // reconcile.go applies snapshot diffs and state transitions for fade-aware records.
-// reconcile is called from Store.ReloadNeighAndFDB and Store.ReloadRoutes.
+// namespaceID scopes the removal pass to a single namespace prefix; 0 means all keys.
 func reconcile[T any](
 	oldMap map[string]T,
 	oldMeta map[string]Meta,
 	newList []T,
 	keyFn func(T) string,
 	fpFn func(T) string,
-	now time.Time,
-) (map[string]T, map[string]Meta, bool) {
-	return reconcileScoped(oldMap, oldMeta, newList, keyFn, fpFn, func(string) bool { return true }, now)
-}
-
-func reconcileNamespace[T any](
-	oldMap map[string]T,
-	oldMeta map[string]Meta,
-	newList []T,
-	keyFn func(T) string,
-	fpFn func(T) string,
 	namespaceID uint64,
-	now time.Time,
-) (map[string]T, map[string]Meta, bool) {
-	prefix := strconv.FormatUint(namespaceID, 10) + "|"
-	return reconcileScoped(oldMap, oldMeta, newList, keyFn, fpFn, func(key string) bool {
-		return strings.HasPrefix(key, prefix)
-	}, now)
-}
-
-func reconcileScoped[T any](
-	oldMap map[string]T,
-	oldMeta map[string]Meta,
-	newList []T,
-	keyFn func(T) string,
-	fpFn func(T) string,
-	shouldRemove func(string) bool,
 	now time.Time,
 ) (map[string]T, map[string]Meta, bool) {
 	changed := false
@@ -81,8 +54,13 @@ func reconcileScoped[T any](
 		oldMeta[k] = prev
 	}
 
+	var prefix string
+	if namespaceID != 0 {
+		prefix = recordPrefix(namespaceID)
+	}
+
 	for k := range oldMap {
-		if !shouldRemove(k) {
+		if prefix != "" && !strings.HasPrefix(k, prefix) {
 			continue
 		}
 		if _, exists := newMap[k]; exists {
@@ -98,3 +76,4 @@ func reconcileScoped[T any](
 	}
 	return oldMap, oldMeta, changed
 }
+
