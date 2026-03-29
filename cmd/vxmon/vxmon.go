@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/pprof"
 	"syscall"
 
@@ -19,6 +21,7 @@ import (
 // vxmon.go wires store events into the Bubble Tea program.
 // main is the process entrypoint and is invoked by `go run`/the built binary.
 func main() {
+
 	debugFile, err := debuglog.ConfigureFromEnv("debug.log")
 	if err != nil {
 		fmt.Println("fatal:", err)
@@ -27,7 +30,6 @@ func main() {
 	if debugFile != nil {
 		defer debugFile.Close()
 	}
-
 	debuglog.Infof("vxmon start")
 	stopCPUProfile, err := startCPUProfileFromEnv()
 	if err != nil {
@@ -37,6 +39,15 @@ func main() {
 	defer debuglog.Infof("vxmon stop")
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	var threads int
+	flag.IntVar(&threads, "t", 0, "number of OS threads (GOMAXPROCS)")
+	flag.IntVar(&threads, "threads", 0, "number of OS threads (GOMAXPROCS)")
+	flag.Parse()
+	if threads > 0 {
+		debuglog.Infof("set GOMAXPROCS to %d", threads)
+		runtime.GOMAXPROCS(threads)
+	}
 
 	st := store.New()
 	m := app.NewModel(st, st.RequestFetchLatest)

@@ -17,13 +17,6 @@ import (
 	"github.com/msstnk/vxmon/internal/types"
 )
 
-type namespaceState struct {
-	info       types.NamespaceInfo
-	mountPoint string
-	handle     *netlink.Handle
-	nsHandle   netns.NsHandle
-}
-
 type discoveredNamespace struct {
 	namespaceID uint64
 	mountPoint  string
@@ -194,7 +187,7 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 	nextList := make([]types.NamespaceInfo, 0, len(discovered))
 
 	for _, item := range discovered {
-		state, ok := s.inventory.namespacesByID[item.namespaceID]
+		state, ok := s.inventory.namespaceState[item.namespaceID]
 		if ok && s.reuseNamespaceState(state, item) {
 			nextStates[item.namespaceID] = state
 			s.ensureNamespaceTopology(item.namespaceID)
@@ -211,7 +204,7 @@ func (s *Store) syncNamespacesWithProcScan(procScan *procScanResult) error {
 	}
 	s.closeRemovedNamespaceStates(nextStates)
 
-	s.inventory.namespacesByID = nextStates
+	s.inventory.namespaceState = nextStates
 	s.inventory.namespaces = nextList
 	s.pruneNamespaceCaches(nextStates)
 	return nil
@@ -277,7 +270,7 @@ func (s *Store) closeNamespaceState(state *namespaceState) {
 }
 
 func (s *Store) closeRemovedNamespaceStates(nextStates map[uint64]*namespaceState) {
-	for id, state := range s.inventory.namespacesByID {
+	for id, state := range s.inventory.namespaceState {
 		if _, ok := nextStates[id]; ok {
 			continue
 		}
@@ -316,7 +309,7 @@ func newNamespaceHandle(item discoveredNamespace) (*netlink.Handle, netns.NsHand
 func (s *Store) namespaceStates() []*namespaceState {
 	out := make([]*namespaceState, 0, len(s.inventory.namespaces))
 	for _, ns := range s.inventory.namespaces {
-		state := s.inventory.namespacesByID[ns.ID]
+		state := s.inventory.namespaceState[ns.ID]
 		if state == nil {
 			continue
 		}
@@ -337,7 +330,6 @@ func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
 		metaChanged = true
 	}
 	dropMissingNamespaceMap(s.runtimeState.processes, states)
-	dropMissingNamespaceMap(s.runtimeState.links, states)
 	dropMissingNamespaceMap(s.referenceState.vrfUsedIfByNS, states)
 	dropMissingNamespaceMap(s.referenceState.vrfUsedIfCompactByNS, states)
 	dropMissingNamespaceMap(s.referenceState.vrfUsedIfCompactHold, states)
@@ -349,10 +341,8 @@ func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
 		delete(s.recordState.processMeta, key)
 		delete(s.runtimeState.processPrev, key)
 	})
-	drop(staleRecordKeys(s.recordState.linkRecords, states), func(key string) {
-		delete(s.recordState.linkRecords, key)
-		delete(s.recordState.linkMeta, key)
-		delete(s.runtimeState.linkHistory, key)
+	drop(staleRecordKeys(s.recordState.ifaceMeta, states), func(key string) {
+		delete(s.recordState.ifaceMeta, key)
 	})
 	drop(staleRecordKeys(s.recordState.neighMeta, states), func(key string) {
 		delete(s.recordState.neighMeta, key)
@@ -364,7 +354,6 @@ func (s *Store) pruneNamespaceCaches(states map[uint64]*namespaceState) {
 		delete(s.recordState.routeMeta, key)
 	})
 
-	s.rebuildInterfaceIndexes()
 	s.rebuildReferenceMaps()
 	if metaChanged {
 		debuglog.Tracef("store.pruneNamespaceCaches meta changed")

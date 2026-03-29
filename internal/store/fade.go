@@ -59,7 +59,14 @@ func (s *Store) Advance(now time.Time) (changed bool, active bool) {
 	// Process meta changes are too noisy to track.
 	_, _ = advanceMeta(s.recordState.processMeta, func(key string) { delete(s.recordState.processRecords, key) }, now)
 
-	c, a = advanceMeta(s.recordState.linkMeta, func(key string) { delete(s.recordState.linkRecords, key) }, now)
+	c, a = advanceMeta(s.recordState.ifaceMeta, func(key string) {
+		if nsID, ok := recordNamespaceID(key); ok {
+			if t, exists := s.inventory.topology[nsID]; exists {
+				delete(t.ifaces, key)
+				s.inventory.topology[nsID] = t
+			}
+		}
+	}, now)
 	if c {
 		debuglog.Tracef("store.Advance link meta changed")
 	}
@@ -113,5 +120,5 @@ func (s *Store) HasActiveFades() bool {
 	return hasActiveMeta(s.recordState.neighMeta) ||
 		hasActiveMeta(s.recordState.fdbMeta) ||
 		hasActiveMeta(s.recordState.routeMeta) ||
-		hasActiveMeta(s.recordState.linkMeta)
+		hasActiveMeta(s.recordState.ifaceMeta)
 }

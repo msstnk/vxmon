@@ -29,3 +29,7 @@ func vrfChildKey(parent vrfItem, it types.InterfaceInfo) string {
 func netnsParentKey(it types.NamespaceInfo) string {
 	return fmt.Sprintf("netns|%d", it.ID)
 }
+
+func fdbFlowKey(bridge, neighIP, port string, vlanID, vxlanID int) string {
+	return fmt.Sprintf("%s|%s|%d|%s|%d", bridge, neighIP, vlanID, port, vxlanID)
+}

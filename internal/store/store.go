@@ -37,7 +37,8 @@ type Record[T any] struct {
 type Store struct {
 	mu sync.RWMutex
 
-	eventCh chan storeEvent
+	eventCh    chan storeEvent
+	nsResyncCh chan struct{}
 
 	inventory      inventory
 	runtimeState   runtimeState
@@ -55,17 +56,16 @@ func New() *Store {
 	}
 
 	return &Store{
-		eventCh: make(chan storeEvent, 1024),
+		eventCh:    make(chan storeEvent, 1024),
+		nsResyncCh: make(chan struct{}, 1),
 		inventory: inventory{
 			selfNamespaceID: selfNamespaceID,
-			namespacesByID:  map[uint64]*namespaceState{},
+			namespaceState:  map[uint64]*namespaceState{},
 			topology:        map[uint64]topologyState{},
 		},
 		runtimeState: runtimeState{
 			processes:   map[uint64][]types.ProcessInfo{},
-			links:       map[uint64][]types.NamespaceLinkInfo{},
 			processPrev: map[string]processSample{},
-			linkHistory: map[string]*linkSampleRing{},
 		},
 		recordState: recordState{
 			neighMeta:      map[string]Meta{},
@@ -73,8 +73,7 @@ func New() *Store {
 			routeMeta:      map[string]Meta{},
 			processRecords: map[string]types.ProcessInfo{},
 			processMeta:    map[string]Meta{},
-			linkRecords:    map[string]types.NamespaceLinkInfo{},
-			linkMeta:       map[string]Meta{},
+			ifaceMeta:      map[string]Meta{},
 		},
 		referenceState: referenceState{
 			vrfUsedIfByNS:        map[uint64]map[int]struct{}{},
@@ -90,6 +89,7 @@ func New() *Store {
 
 func newTopologyState() topologyState {
 	return topologyState{
+		ifaces: map[string]types.InterfaceInfo{},
 		neigh:  map[string]types.NeighEntry{},
 		fdb:    map[string]types.FdbEntry{},
 		routes: map[string]types.RouteEntry{},
@@ -127,7 +127,7 @@ func (s *Store) bumpMetaRevisionLocked() {
 }
 
 func (s *Store) namespaceState(namespaceID uint64) *namespaceState {
-	return s.inventory.namespacesByID[namespaceID]
+	return s.inventory.namespaceState[namespaceID]
 }
 
 func (s *Store) Namespaces() []types.NamespaceInfo {
@@ -141,25 +141,35 @@ func (s *Store) Namespaces() []types.NamespaceInfo {
 func (s *Store) NamespaceInfo(id uint64) (types.NamespaceInfo, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	state := s.inventory.namespacesByID[id]
+	state := s.inventory.namespaceState[id]
 	if state == nil {
 		return types.NamespaceInfo{}, false
 	}
 	return state.info, true
 }
 
-func (s *Store) Interfaces() []types.InterfaceInfo {
+func (s *Store) InterfaceRecords(nsID uint64, includeRemoved bool, sortByRate bool) []Record[types.InterfaceInfo] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]types.InterfaceInfo, len(s.inventory.ifaces))
-	copy(out, s.inventory.ifaces)
-	return out
+	return sortedTopologyRecords(s.inventory.topology, s.recordState.ifaceMeta, nsID, includeRemoved,
+		func(t topologyState) map[string]types.InterfaceInfo { return t.ifaces },
+		func(a, b Record[types.InterfaceInfo]) bool {
+			if sortByRate {
+				ai := a.Val.RxBps + a.Val.TxBps
+				aj := b.Val.RxBps + b.Val.TxBps
+				if ai != aj {
+					return ai > aj
+				}
+				return a.Val.IfIndex < b.Val.IfIndex
+			}
+			return a.Val.IfIndex < b.Val.IfIndex
+		})
 }
 
-func (s *Store) NeighRecords(includeRemoved bool) []Record[types.NeighEntry] {
+func (s *Store) NeighRecords(nsID uint64, includeRemoved bool) []Record[types.NeighEntry] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return sortedTopologyRecords(s.inventory.topology, s.recordState.neighMeta, includeRemoved,
+	return sortedTopologyRecords(s.inventory.topology, s.recordState.neighMeta, nsID, includeRemoved,
 		func(t topologyState) map[string]types.NeighEntry { return t.neigh },
 		func(a, b Record[types.NeighEntry]) bool {
 			if a.Val.NamespaceRoot != b.Val.NamespaceRoot {
@@ -175,10 +185,10 @@ func (s *Store) NeighRecords(includeRemoved bool) []Record[types.NeighEntry] {
 		})
 }
 
-func (s *Store) FDBRecords(includeRemoved bool) []Record[types.FdbEntry] {
+func (s *Store) FDBRecords(nsID uint64, includeRemoved bool) []Record[types.FdbEntry] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return sortedTopologyRecords(s.inventory.topology, s.recordState.fdbMeta, includeRemoved,
+	return sortedTopologyRecords(s.inventory.topology, s.recordState.fdbMeta, nsID, includeRemoved,
 		func(t topologyState) map[string]types.FdbEntry { return t.fdb },
 		func(a, b Record[types.FdbEntry]) bool {
 			if a.Val.NamespaceRoot != b.Val.NamespaceRoot {
@@ -200,10 +210,10 @@ func (s *Store) FDBRecords(includeRemoved bool) []Record[types.FdbEntry] {
 		})
 }
 
-func (s *Store) RouteRecords(includeRemoved bool) []Record[types.RouteEntry] {
+func (s *Store) RouteRecords(nsID uint64, includeRemoved bool) []Record[types.RouteEntry] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return sortedTopologyRecords(s.inventory.topology, s.recordState.routeMeta, includeRemoved,
+	return sortedTopologyRecords(s.inventory.topology, s.recordState.routeMeta, nsID, includeRemoved,
 		func(t topologyState) map[string]types.RouteEntry { return t.routes },
 		func(a, b Record[types.RouteEntry]) bool {
 			if a.Val.NamespaceRoot != b.Val.NamespaceRoot {
@@ -235,33 +245,6 @@ func (s *Store) NamespaceProcessRecords(nsID uint64, includeRemoved bool) []Reco
 	return out
 }
 
-func (s *Store) NamespaceLinks(nsID uint64) []types.NamespaceLinkInfo {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rows := s.runtimeState.links[nsID]
-	out := make([]types.NamespaceLinkInfo, len(rows))
-	copy(out, rows)
-	return out
-}
-
-func (s *Store) NamespaceLinkRecords(nsID uint64, includeRemoved bool) []Record[types.NamespaceLinkInfo] {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	prefix := recordPrefix(nsID)
-	out := collectRecords(s.recordState.linkRecords, s.recordState.linkMeta, includeRemoved, func(key string, _ types.NamespaceLinkInfo) bool {
-		return strings.HasPrefix(key, prefix)
-	})
-	sort.Slice(out, func(i, j int) bool {
-		ai := out[i].Val.RxBps + out[i].Val.TxBps
-		aj := out[j].Val.RxBps + out[j].Val.TxBps
-		if ai != aj {
-			return ai > aj
-		}
-		return out[i].Val.IfIndex < out[j].Val.IfIndex
-	})
-	return out
-}
-
 func collectRecords[T any](
 	records map[string]T,
 	metaMap map[string]Meta,
@@ -285,11 +268,12 @@ func collectRecords[T any](
 func sortedTopologyRecords[T any](
 	topology map[uint64]topologyState,
 	metaMap map[string]Meta,
+	nsID uint64,
 	includeRemoved bool,
 	pick func(topologyState) map[string]T,
 	less func(a, b Record[T]) bool,
 ) []Record[T] {
-	out := collectTopologyRecords(topology, metaMap, includeRemoved, pick)
+	out := collectTopologyRecords(topology, metaMap, nsID, includeRemoved, pick)
 	sort.Slice(out, func(i, j int) bool { return less(out[i], out[j]) })
 	return out
 }
@@ -297,10 +281,25 @@ func sortedTopologyRecords[T any](
 func collectTopologyRecords[T any](
 	topology map[uint64]topologyState,
 	metaMap map[string]Meta,
+	nsID uint64,
 	includeRemoved bool,
 	pick func(topologyState) map[string]T,
 ) []Record[T] {
 	out := make([]Record[T], 0, len(metaMap))
+	if nsID != 0 {
+		t, ok := topology[nsID]
+		if !ok {
+			return nil
+		}
+		for key, val := range pick(t) {
+			meta := metaMap[key]
+			if !includeRemoved && meta.State == StateRemoved {
+				continue
+			}
+			out = append(out, Record[T]{Key: key, Val: val, Meta: meta})
+		}
+		return out
+	}
 	for _, t := range topology {
 		rows := pick(t)
 		for key, val := range rows {

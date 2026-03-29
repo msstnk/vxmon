@@ -89,6 +89,8 @@ func (s *Store) ListenNetlink(ctx context.Context, send func(any)) {
 			return
 		case <-ticker.C:
 			resync()
+		case <-s.nsResyncCh:
+			resync()
 		}
 	}
 }

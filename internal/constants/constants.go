@@ -7,15 +7,16 @@ import (
 )
 
 const (
-	AppTitle                  = "vxmon 0.1.5"
+	AppTitle                  = "vxmon 0.1.6"
 	ClockTickInterval         = time.Second
 	AnimTickInterval          = 100 * time.Millisecond
 	NLMsgAggregationTimer     = 50 * time.Millisecond
 	NLMsgThrottleInterval     = 200 * time.Millisecond
-	NamespaceResyncInterval   = 3 * time.Second
+	NamespaceResyncInterval   = 5 * time.Second
 	RuntimeRefreshInterval    = 5 * time.Second
 	LinkRateHistoryDepth      = 4
-	LinkRateMaxSampleInterval = 10 * time.Second
+	LinkRateMaxSampleWindow   = 10 * time.Second
+	MinimumLinkSampleInterval = 1000 * time.Millisecond
 	FadeDuration              = 2400 * time.Millisecond
 	DefaultTopPanePercent     = 50
 	MinTopPanePercent         = 30

@@ -75,7 +75,11 @@ func logf(target Level, prefix string, format string, args ...any) {
 	}
 	logger.Printf(prefix+" "+format, args...)
 }
-
+func IsTraceEnabled() bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	return level >= LevelTrace
+}
 func parseLevel(raw string) Level {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", "0", "off", "false", "no":
