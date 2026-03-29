@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -54,7 +55,14 @@ func collectInterfaceRaw(ns types.NamespaceInfo, nsHandle int) (interfaceInfoRaw
 	}, nil
 }
 
-func parseInterfaceRaw(raw interfaceInfoRaw, ns types.NamespaceInfo, history map[string]*linkSampleRing) ([]types.InterfaceInfo, []types.NamespaceLinkInfo) {
+func parseInterfaceRaw(raw interfaceInfoRaw, ns types.NamespaceInfo, oldIfaces map[string]types.InterfaceInfo, now time.Time) []types.InterfaceInfo {
+	oldByIndex := make(map[int]*types.LinkSampleRing, len(oldIfaces))
+	for _, iface := range oldIfaces {
+		if iface.History != nil {
+			oldByIndex[iface.IfIndex] = iface.History
+		}
+	}
+
 	indexToName := make(map[int]string, len(raw.links))
 	for _, link := range raw.links {
 		indexToName[link.Attrs().Index] = link.Attrs().Name
@@ -68,7 +76,6 @@ func parseInterfaceRaw(raw interfaceInfoRaw, ns types.NamespaceInfo, history map
 	}
 
 	results := make([]types.InterfaceInfo, 0, len(raw.links))
-	links := make([]types.NamespaceLinkInfo, 0, len(raw.links))
 	for _, link := range raw.links {
 		attrs := link.Attrs()
 		linkType := link.Type()
@@ -80,8 +87,8 @@ func parseInterfaceRaw(raw interfaceInfoRaw, ns types.NamespaceInfo, history map
 			IfIndex:          attrs.Index,
 			InterfaceName:    attrs.Name,
 			IfType:           linkType,
-			ParentID:         attrs.ParentIndex,
-			MasterID:         attrs.MasterIndex,
+			ParentIndex:      attrs.ParentIndex,
+			MasterIndex:      attrs.MasterIndex,
 			MACAddr:          attrs.HardwareAddr.String(),
 			STPState:         -1,
 			BridgePortState:  -1,
@@ -132,32 +139,23 @@ func parseInterfaceRaw(raw interfaceInfoRaw, ns types.NamespaceInfo, history map
 				info.TableID = uint32(tableID)
 			}
 		}
-		results = append(results, info)
 
-		if attrs.Statistics == nil {
-			continue
-		}
-		var rxBps uint64
-		var txBps uint64
-		if history != nil {
-			if ring := history[linkSampleKey(ns.ID, attrs.Index)]; ring != nil {
-				rxBps, txBps = ring.averageBps(constants.LinkRateMaxSampleInterval)
+		if attrs.Statistics != nil {
+			ring := oldByIndex[attrs.Index]
+			if ring == nil {
+				ring = types.NewLinkSampleRing()
 			}
+			ring.Push(attrs.Statistics.RxBytes, attrs.Statistics.TxBytes, now)
+			info.RxBps, info.TxBps = ring.AverageBps(constants.LinkRateMaxSampleWindow)
+			info.RxErrors = attrs.Statistics.RxErrors
+			info.TxErrors = attrs.Statistics.TxErrors
+			info.History = ring
 		}
-		links = append(links, types.NamespaceLinkInfo{
-			NamespaceID: ns.ID,
-			IfIndex:     attrs.Index,
-			Name:        attrs.Name,
-			Type:        linkType,
-			RxBps:       rxBps,
-			TxBps:       txBps,
-			RxErrors:    attrs.Statistics.RxErrors,
-			TxErrors:    attrs.Statistics.TxErrors,
-		})
+
+		results = append(results, info)
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].IfIndex < results[j].IfIndex })
-	sort.Slice(links, func(i, j int) bool { return links[i].IfIndex < links[j].IfIndex })
-	return results, links
+	return results
 }
 
 func getLinkListRaw(h *netlink.Handle) (linkListRaw, error) {

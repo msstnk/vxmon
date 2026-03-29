@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"sort"
+	"strconv"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -80,204 +81,131 @@ func socketSummary(ns types.NamespaceInfo) string {
 	return fmt.Sprintf("%d (TCP: %d UDP: %d TCP6: %d UDP6: %d)", ns.SocketUsed, ns.TCPInUse, ns.UDPInUse, ns.TCP6InUse, ns.UDP6InUse)
 }
 
-func buildBridgeItems(ifaces []types.InterfaceInfo, st *store.Store) []bridgeItem {
+func buildBridgeItems(ns types.NamespaceInfo, ifaces []types.InterfaceInfo, st *store.Store) []bridgeItem {
 	bridgeInfo := map[string]types.InterfaceInfo{}
 	bound := map[string][]types.InterfaceInfo{}
-
 	for _, it := range ifaces {
 		if it.IfType == "bridge" {
-			bridgeInfo[bridgeGroupKey(it.NamespaceID, it.InterfaceName)] = it
+			bridgeInfo[it.InterfaceName] = it
 		}
 	}
 	for _, it := range ifaces {
 		if it.MasterName == "" {
 			continue
 		}
-		key := bridgeGroupKey(it.NamespaceID, it.MasterName)
-		if _, ok := bridgeInfo[key]; ok {
+		if _, ok := bridgeInfo[it.MasterName]; ok {
 			if st.IsBridgePortReferenced(it.NamespaceID, it.IfIndex) {
-				bound[key] = append(bound[key], it)
+				bound[it.MasterName] = append(bound[it.MasterName], it)
 			}
 		}
 	}
-
 	items := make([]bridgeItem, 0, len(bridgeInfo))
-	for key, info := range bridgeInfo {
-		devs := bound[key]
+	for name, info := range bridgeInfo {
+		devs := bound[name]
 		sort.Slice(devs, func(i, j int) bool { return devs[i].IfIndex < devs[j].IfIndex })
 		items = append(items, bridgeItem{
-			NamespaceID:   info.NamespaceID,
-			NamespaceName: info.NamespaceName,
-			NamespaceRoot: info.NamespaceRoot,
+			NamespaceID:   ns.ID,
+			NamespaceName: ns.ShortName,
+			NamespaceRoot: ns.IsRoot,
 			Label:         bridgeDisplayName(info),
 			Info:          info,
 			Devs:          devs,
 		})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].NamespaceRoot != items[j].NamespaceRoot {
-			return items[i].NamespaceRoot
-		}
-		if items[i].NamespaceName != items[j].NamespaceName {
-			return items[i].NamespaceName < items[j].NamespaceName
-		}
-		return items[i].Info.IfIndex < items[j].Info.IfIndex
-	})
+	sort.Slice(items, func(i, j int) bool { return items[i].Info.IfIndex < items[j].Info.IfIndex })
 	return items
 }
 
-func (m *Model) bridgeItems() []bridgeItem {
-	return buildBridgeItems(m.st.Interfaces(), m.st)
-}
-
-func buildVRFItems(ifaces []types.InterfaceInfo, st *store.Store, detailed bool) []vrfItem {
-	byNS := map[uint64][]types.InterfaceInfo{}
-	nsInfo := map[uint64]types.InterfaceInfo{}
+func buildVRFItems(ns types.NamespaceInfo, ifaces []types.InterfaceInfo, st *store.Store, detailed bool) []vrfItem {
+	vrfMasters := make(map[int]types.InterfaceInfo, len(ifaces))
 	for _, it := range ifaces {
-		byNS[it.NamespaceID] = append(byNS[it.NamespaceID], it)
-		if _, ok := nsInfo[it.NamespaceID]; !ok {
-			nsInfo[it.NamespaceID] = it
+		if it.IfType == "vrf" {
+			vrfMasters[it.IfIndex] = it
 		}
 	}
 
-	var nsIDs []uint64
-	for nsID := range byNS {
-		nsIDs = append(nsIDs, nsID)
+	bound := make(map[int][]types.InterfaceInfo, len(ifaces))
+	var global []types.InterfaceInfo
+	for _, it := range ifaces {
+		if it.IfType == "vrf" {
+			bound[it.IfIndex] = append(bound[it.IfIndex], it)
+		}
+		if !st.IsVRFInterfaceReferenced(it.NamespaceID, it.IfIndex, detailed) {
+			continue
+		}
+		if it.MasterIndex != 0 {
+			if _, ok := vrfMasters[it.MasterIndex]; ok {
+				bound[it.MasterIndex] = append(bound[it.MasterIndex], it)
+				continue
+			}
+		}
+		global = append(global, it)
 	}
-	sort.Slice(nsIDs, func(i, j int) bool {
-		a := nsInfo[nsIDs[i]]
-		b := nsInfo[nsIDs[j]]
-		if a.NamespaceRoot != b.NamespaceRoot {
-			return a.NamespaceRoot
-		}
-		return a.NamespaceName < b.NamespaceName
-	})
 
-	var items []vrfItem
-	for _, nsID := range nsIDs {
-		nsIfaces := byNS[nsID]
-		ref := nsInfo[nsID]
+	sort.Slice(global, func(i, j int) bool { return global[i].IfIndex < global[j].IfIndex })
+	items := []vrfItem{{
+		NamespaceID:   ns.ID,
+		NamespaceName: ns.ShortName,
+		NamespaceRoot: ns.IsRoot,
+		Name:          constants.DefaultVRFName,
+		Label:         vrfDisplayName(constants.DefaultVRFName, ns.ShortName, ns.IsRoot),
+		TableID:       constants.DefaultVRFTableID,
+		IfIndex:       0,
+		Devs:          global,
+	}}
 
-		vrfMasters := map[string]types.InterfaceInfo{}
-		bound := map[string][]types.InterfaceInfo{}
-		for _, it := range nsIfaces {
-			if it.IfType == "vrf" {
-				vrfMasters[it.InterfaceName] = it
-			}
-		}
-		for _, it := range nsIfaces {
-			if it.MasterName == "" {
-				continue
-			}
-			if _, ok := vrfMasters[it.MasterName]; ok {
-				if st.IsVRFInterfaceReferenced(it.NamespaceID, it.IfIndex, detailed) {
-					bound[it.MasterName] = append(bound[it.MasterName], it)
-				}
-			}
-		}
-
-		vrfMasterSet := map[string]struct{}{}
-		for name := range vrfMasters {
-			vrfMasterSet[name] = struct{}{}
-		}
-		var global []types.InterfaceInfo
-		for _, it := range nsIfaces {
-			if !st.IsVRFInterfaceReferenced(it.NamespaceID, it.IfIndex, detailed) {
-				continue
-			}
-			if it.MasterName == "" {
-				global = append(global, it)
-				continue
-			}
-			if _, ok := vrfMasterSet[it.MasterName]; !ok {
-				global = append(global, it)
-			}
-		}
-		sort.Slice(global, func(i, j int) bool { return global[i].IfIndex < global[j].IfIndex })
+	masterIndices := make([]int, 0, len(vrfMasters))
+	for idx := range vrfMasters {
+		masterIndices = append(masterIndices, idx)
+	}
+	sort.Ints(masterIndices)
+	for _, idx := range masterIndices {
+		master := vrfMasters[idx]
+		devs := bound[idx]
+		sort.Slice(devs, func(i, j int) bool { return devs[i].IfIndex < devs[j].IfIndex })
 		items = append(items, vrfItem{
-			NamespaceID:   nsID,
-			NamespaceName: ref.NamespaceName,
-			NamespaceRoot: ref.NamespaceRoot,
-			Name:          constants.DefaultVRFName,
-			Label:         vrfDisplayName(constants.DefaultVRFName, ref.NamespaceName, ref.NamespaceRoot),
-			TableID:       constants.DefaultVRFTableID,
-			IfIndex:       0,
-			Devs:          global,
+			NamespaceID:   ns.ID,
+			NamespaceName: ns.ShortName,
+			NamespaceRoot: ns.IsRoot,
+			Name:          master.InterfaceName,
+			Label:         vrfDisplayName(master.InterfaceName, ns.ShortName, ns.IsRoot),
+			TableID:       master.TableID,
+			IfIndex:       master.IfIndex,
+			Devs:          devs,
 		})
-
-		var masterNames []string
-		for name := range vrfMasters {
-			masterNames = append(masterNames, name)
-		}
-		sort.Slice(masterNames, func(i, j int) bool {
-			return vrfMasters[masterNames[i]].IfIndex < vrfMasters[masterNames[j]].IfIndex
-		})
-
-		for _, name := range masterNames {
-			devs := bound[name]
-			sort.Slice(devs, func(i, j int) bool { return devs[i].IfIndex < devs[j].IfIndex })
-			master := vrfMasters[name]
-			items = append(items, vrfItem{
-				NamespaceID:   nsID,
-				NamespaceName: ref.NamespaceName,
-				NamespaceRoot: ref.NamespaceRoot,
-				Name:          name,
-				Label:         vrfDisplayName(name, ref.NamespaceName, ref.NamespaceRoot),
-				TableID:       master.TableID,
-				IfIndex:       master.IfIndex,
-				Devs:          devs,
-			})
-		}
 	}
 	return items
 }
 
-func (m *Model) vrfItems() []vrfItem {
-	return buildVRFItems(m.st.Interfaces(), m.st, m.detailed)
-}
-
-func (m *Model) currentTopItems() topItems {
-	ifaces := m.st.Interfaces()
-	return topItems{
-		bridges: buildBridgeItems(ifaces, m.st),
-		vrfs:    buildVRFItems(ifaces, m.st, m.detailed),
-		netns:   m.st.Namespaces(),
+func (m *Model) refreshTopItems() {
+	nss := m.st.Namespaces()
+	var bridges []bridgeItem
+	var vrfs []vrfItem
+	for _, ns := range nss {
+		recs := m.st.InterfaceRecords(ns.ID, false, false)
+		ifaces := make([]types.InterfaceInfo, len(recs))
+		for i, r := range recs {
+			ifaces[i] = r.Val
+		}
+		bridges = append(bridges, buildBridgeItems(ns, ifaces, m.st)...)
+		vrfs = append(vrfs, buildVRFItems(ns, ifaces, m.st, m.detailed)...)
 	}
+	m.topItems = topItems{bridges: bridges, vrfs: vrfs, netns: nss}
 }
 
-func matchesVRFRouteTable(vrfTableID uint32, routeTableID uint32) bool {
-	if routeTableID == vrfTableID {
-		return true
-	}
-	return vrfTableID == constants.DefaultVRFTableID && routeTableID == constants.MainRouteTableID
-}
-
-func pickBridge(items []bridgeItem, cursor int) bridgeItem {
+func pick[T any](items []T, cursor int) T {
 	if len(items) == 0 {
-		return bridgeItem{}
+		var zero T
+		return zero
 	}
 	return items[clamp(cursor, 0, len(items)-1)]
 }
 
-func pickVRF(items []vrfItem, cursor int) vrfItem {
-	if len(items) == 0 {
-		return vrfItem{}
-	}
-	return items[clamp(cursor, 0, len(items)-1)]
-}
-
-func pickNETNS(items []netnsItem, cursor int) types.NamespaceInfo {
-	if len(items) == 0 {
-		return types.NamespaceInfo{}
-	}
-	return items[clamp(cursor, 0, len(items)-1)]
-}
-
-func bridgeIfFilter(items []bridgeItem, cursor int, filterIdx int, mode TopMode) (ifName string, ok bool) {
+func bridgeIfFilter(items []bridgeItem, cursor, filterIdx int, mode TopMode) (ifName string, ok bool) {
 	if mode != TopBridge || filterIdx < 0 {
 		return "", false
 	}
-	bridge := pickBridge(items, cursor)
+	bridge := pick(items, cursor)
 	if bridge.Info.InterfaceName == "" {
 		return "", false
 	}
@@ -287,61 +215,51 @@ func bridgeIfFilter(items []bridgeItem, cursor int, filterIdx int, mode TopMode)
 	return bridge.Devs[filterIdx].InterfaceName, true
 }
 
-func bridgeVisibleChildRange(items []bridgeItem, cursor int, filterIdx int, visibleTop int, mode TopMode) (start int, end int) {
-	bridge := pickBridge(items, cursor)
-	if bridge.Info.InterfaceName == "" {
-		return 0, 0
-	}
-	if mode != TopBridge || visibleTop <= 1 {
-		return 0, len(bridge.Devs)
+// visibleChildRange returns [start, end) for rendering a child list within visibleTop rows.
+// Keeps the selected filterIdx in view; -1 means no selection (show from start).
+func visibleChildRange(total, filterIdx, visibleTop int) (int, int) {
+	if visibleTop <= 1 {
+		return 0, total
 	}
 	slots := visibleTop - 1
-	if len(bridge.Devs) <= slots {
-		return 0, len(bridge.Devs)
+	if total <= slots {
+		return 0, total
 	}
-
 	if filterIdx < 0 {
 		return 0, slots
 	}
-	selected := clamp(filterIdx, 0, len(bridge.Devs)-1)
-	start = selected - slots + 1
+	start := clamp(filterIdx, 0, total-1) - slots + 1
 	if start < 0 {
 		start = 0
 	}
-	end = start + slots
-	if end > len(bridge.Devs) {
-		end = len(bridge.Devs)
+	end := start + slots
+	if end > total {
+		end = total
 		start = max(0, end-slots)
 	}
 	return start, end
 }
 
-func vrfVisibleChildRange(items []vrfItem, cursor int, filterIdx int, visibleTop int, mode TopMode) (start int, end int) {
+func bridgeVisibleChildRange(items []bridgeItem, cursor, filterIdx, visibleTop int, mode TopMode) (int, int) {
+	bridge := pick(items, cursor)
+	if bridge.Info.InterfaceName == "" {
+		return 0, 0
+	}
+	if mode != TopBridge {
+		return 0, len(bridge.Devs)
+	}
+	return visibleChildRange(len(bridge.Devs), filterIdx, visibleTop)
+}
+
+func vrfVisibleChildRange(items []vrfItem, cursor, filterIdx, visibleTop int, mode TopMode) (int, int) {
 	if len(items) == 0 {
 		return 0, 0
 	}
-	vrf := pickVRF(items, cursor)
-	if mode != TopVRF || visibleTop <= 1 {
+	vrf := pick(items, cursor)
+	if mode != TopVRF {
 		return 0, len(vrf.Devs)
 	}
-	slots := visibleTop - 1
-	if len(vrf.Devs) <= slots {
-		return 0, len(vrf.Devs)
-	}
-	if filterIdx < 0 {
-		return 0, slots
-	}
-	selected := clamp(filterIdx, 0, len(vrf.Devs)-1)
-	start = selected - slots + 1
-	if start < 0 {
-		start = 0
-	}
-	end = start + slots
-	if end > len(vrf.Devs) {
-		end = len(vrf.Devs)
-		start = max(0, end-slots)
-	}
-	return start, end
+	return visibleChildRange(len(vrf.Devs), filterIdx, visibleTop)
 }
 
 func vrfIfFilter(displayDevs []types.InterfaceInfo, filterIdx int, mode TopMode) (ifName string, ok bool) {
@@ -351,7 +269,23 @@ func vrfIfFilter(displayDevs []types.InterfaceInfo, filterIdx int, mode TopMode)
 	return displayDevs[filterIdx].InterfaceName, true
 }
 
-func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, cursorRenderedIndex int) {
+func (m *Model) buildTopRows(visibleTop int) (rows []ui.ListRow, cursorRenderedIndex int) {
+	type displayRow struct {
+		cols  []string
+		style lipgloss.Style
+	}
+	toListRows := func(drs []displayRow) []ui.ListRow {
+		tr := make([][]string, len(drs))
+		for i := range drs {
+			tr[i] = drs[i].cols
+		}
+		lines := ui.FormatRows(tr, m.width-6)
+		rs := make([]ui.ListRow, len(lines))
+		for i, line := range lines {
+			rs[i] = ui.ListRow{Text: line, Style: drs[i].style}
+		}
+		return rs
+	}
 	base := lipgloss.NewStyle()
 	child := lipgloss.NewStyle().Foreground(ui.ColorTopChild)
 	childSelected := child.Foreground(ui.ColorTopChildSelected)
@@ -360,21 +294,17 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 
 	switch m.topMode {
 	case TopBridge:
-		bridges := data.bridges
+		bridges := m.topItems.bridges
 		cur := clamp(m.bridgeCursor, 0, len(bridges)-1)
 		filterIf, filterOn := bridgeIfFilter(bridges, m.bridgeCursor, m.bridgeDevFilterIdx, m.topMode)
-		type displayRow struct {
-			cols  []string
-			style lipgloss.Style
-		}
-		displayRows := make([]displayRow, 0, len(bridges))
-		cursorRenderedIndex = cur
+		displayRows := make([]displayRow, 0, len(bridges)+visibleTop)
+
 		for i, b := range bridges {
 			displayRows = append(displayRows, displayRow{
 				cols: []string{
 					b.Label,
-					fmt.Sprintf("%s/%s", b.Info.Status, b.Info.OperState),
-					fmt.Sprintf("stp:%s", helpers.BridgeSTPStateLabel(b.Info.STPState)),
+					b.Info.Status + "/" + b.Info.OperState,
+					"stp:" + helpers.BridgeSTPStateLabel(b.Info.STPState),
 					"",
 					b.Info.MACAddr,
 				},
@@ -386,78 +316,58 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 			cursorRenderedIndex = len(displayRows) - 1
 			childStart, childEnd := bridgeVisibleChildRange(bridges, m.bridgeCursor, m.bridgeDevFilterIdx, visibleTop, m.topMode)
 			for _, d := range b.Devs[childStart:childEnd] {
-				vni := "-"
-				if d.VxlanID > 0 {
-					vni = fmt.Sprintf("%d", d.VxlanID)
-				}
-				baseStyle := child
+				stBase := child
 				if filterOn {
 					if d.InterfaceName == filterIf {
-						baseStyle = childSelected
+						stBase = childSelected
 					} else {
-						baseStyle = childDim
+						stBase = childDim
 					}
 				}
-				st := ui.FadeStyle(m.topParentMeta[bridgeChildKey(b, d)], now, baseStyle)
+				vni := "-"
+				if d.VxlanID > 0 {
+					vni = strconv.Itoa(d.VxlanID)
+				}
 				displayRows = append(displayRows, displayRow{
 					cols: []string{
 						"  " + d.InterfaceName,
-						fmt.Sprintf("%s/%s", d.Status, d.OperState),
+						d.Status + "/" + d.OperState,
 						helpers.BridgePortStateLabel(d.BridgePortState),
 						vni,
 						d.MACAddr,
 					},
-					style: st,
+					style: ui.FadeStyle(m.topParentMeta[bridgeChildKey(b, d)], now, stBase),
 				})
 			}
 		}
-		tableRows := make([][]string, 0, len(displayRows))
-		for _, row := range displayRows {
-			tableRows = append(tableRows, row.cols)
-		}
-		lines := ui.FormatRows(tableRows, m.width-6)
-		for i, line := range lines {
-			rows = append(rows, ui.ListRow{Text: line, Style: displayRows[i].style})
-		}
-		return rows, cursorRenderedIndex
+		return toListRows(displayRows), cursorRenderedIndex
 
 	case TopNETNS:
-		items := data.netns
+		items := m.topItems.netns
 		cursorRenderedIndex = clamp(m.netnsCursor, 0, len(items)-1)
-		tableRows := make([][]string, 0, len(items))
-		for _, item := range items {
-			tableRows = append(tableRows, []string{
-				namespaceListLabel(item),
-				fmt.Sprintf("%d", item.ID),
-				socketSummary(item),
-			})
+		drs := make([]displayRow, len(items))
+		for i, item := range items {
+			drs[i] = displayRow{
+				cols: []string{
+					namespaceListLabel(item),
+					strconv.FormatUint(item.ID, 10),
+					socketSummary(item),
+				},
+				style: ui.FadeStyle(m.topParentMeta[netnsParentKey(item)], now, base),
+			}
 		}
-		lines := ui.FormatRows(tableRows, m.width-6)
-		for i, line := range lines {
-			rows = append(rows, ui.ListRow{
-				Text:  line,
-				Style: ui.FadeStyle(m.topParentMeta[netnsParentKey(items[i])], now, base),
-			})
-		}
-		return rows, cursorRenderedIndex
+		return toListRows(drs), cursorRenderedIndex
 
 	default:
-		vrfs := data.vrfs
+		vrfs := m.topItems.vrfs
 		cur := clamp(m.vrfCursor, 0, len(vrfs)-1)
-		selected := pickVRF(vrfs, m.vrfCursor)
-		selectedDisplayDevs := selected.Devs
-		filterIf, filterOn := vrfIfFilter(selectedDisplayDevs, m.vrfDevFilterIdx, m.topMode)
+		selected := pick(vrfs, m.vrfCursor)
+		filterIf, filterOn := vrfIfFilter(selected.Devs, m.vrfDevFilterIdx, m.topMode)
 		childStart, childEnd := vrfVisibleChildRange(vrfs, m.vrfCursor, m.vrfDevFilterIdx, visibleTop, m.topMode)
-		type displayRow struct {
-			cols  []string
-			style lipgloss.Style
-		}
-		displayRows := make([]displayRow, 0, len(vrfs))
-		cursorRenderedIndex = cur
+		displayRows := make([]displayRow, 0, len(vrfs)+visibleTop)
+
 		for i, vrf := range vrfs {
-			displayDevs := vrf.Devs
-			cnt := len(displayDevs)
-			countText := fmt.Sprintf("(L3 devs: %d)", cnt)
+			countText := "(L3 devs: " + strconv.Itoa(len(vrf.Devs)) + ")"
 			if i == cur && filterOn {
 				countText += " (filtered)"
 			}
@@ -467,40 +377,30 @@ func (m *Model) buildTopRows(visibleTop int, data topItems) (rows []ui.ListRow, 
 			})
 			if i == cur {
 				cursorRenderedIndex = len(displayRows) - 1
-				for _, d := range selectedDisplayDevs[childStart:childEnd] {
-					baseStyle := child
+				for _, d := range selected.Devs[childStart:childEnd] {
+					stBase := child
 					if filterOn {
 						if d.InterfaceName == filterIf {
-							baseStyle = childSelected
+							stBase = childSelected
 						} else {
-							baseStyle = childDim
+							stBase = childDim
 						}
 					}
-					st := ui.FadeStyle(m.topParentMeta[vrfChildKey(vrf, d)], now, baseStyle)
 					displayRows = append(displayRows, displayRow{
 						cols: []string{
 							"  " + d.InterfaceName,
-							fmt.Sprintf("%s/%s", d.Status, d.OperState),
+							d.Status + "/" + d.OperState,
 							d.IfType,
 							d.MACAddr,
 						},
-						style: st,
+						style: ui.FadeStyle(m.topParentMeta[vrfChildKey(vrf, d)], now, stBase),
 					})
 				}
 			}
 		}
-		tableRows := make([][]string, 0, len(displayRows))
-		for _, row := range displayRows {
-			tableRows = append(tableRows, row.cols)
-		}
-		lines := ui.FormatRows(tableRows, m.width-6)
-		for i, line := range lines {
-			rows = append(rows, ui.ListRow{Text: line, Style: displayRows[i].style})
-		}
 		if len(vrfs) == 0 {
 			cursorRenderedIndex = 0
 		}
-		return rows, cursorRenderedIndex
+		return toListRows(displayRows), cursorRenderedIndex
 	}
 }
-

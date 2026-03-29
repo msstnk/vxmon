@@ -39,7 +39,6 @@ func (s *Store) reloadRuntime(now time.Time) error {
 
 func (s *Store) reloadInterfaces(now time.Time) {
 	reloadNamespaceRows(s, now, s.collectNamespaceInterfaces, s.applyNamespaceInterfaces)
-	s.rebuildInterfaceIndexes()
 }
 
 func (s *Store) reloadNeighAndFDB(now time.Time) {
@@ -106,13 +105,10 @@ func (s *Store) applyNamespaceInterfaces(state *namespaceState, raw interfaceInf
 	}
 	id := state.info.ID
 	t := s.topologyState(id)
-	updateLinkHistory(raw, id, now, s.runtimeState.linkHistory)
-	ifaces, links := parseInterfaceRaw(raw, state.info, s.runtimeState.linkHistory)
-	t.ifaces = ifaces
-	s.inventory.topology[id] = t
-	s.runtimeState.links[id] = links
+	ifaces := parseInterfaceRaw(raw, state.info, t.ifaces, now)
 	var c bool
-	s.recordState.linkRecords, s.recordState.linkMeta, c = reconcile(s.recordState.linkRecords, s.recordState.linkMeta, links, linkKey, linkFingerprint, id, now)
+	t.ifaces, s.recordState.ifaceMeta, c = reconcile(t.ifaces, s.recordState.ifaceMeta, ifaces, linkKey, linkFingerprint, id, now)
+	s.inventory.topology[id] = t
 	if c {
 		s.bumpMetaRevisionLocked()
 	}
@@ -187,26 +183,3 @@ func (s *Store) applyNamespaceRoutes(state *namespaceState, raw namespaceRouteSn
 	s.inventory.topology[id] = t
 }
 
-func (s *Store) rebuildInterfaceIndexes() {
-	total := 0
-	for _, ns := range s.inventory.namespaces {
-		total += len(s.inventory.topology[ns.ID].ifaces)
-	}
-	out := make([]types.InterfaceInfo, 0, total)
-	for _, ns := range s.inventory.namespaces {
-		out = append(out, s.inventory.topology[ns.ID].ifaces...)
-	}
-	changed := len(s.inventory.ifaces) != len(out)
-	if !changed {
-		for i := range out {
-			if s.inventory.ifaces[i] != out[i] {
-				changed = true
-				break
-			}
-		}
-	}
-	s.inventory.ifaces = out
-	if changed {
-		s.bumpMetaRevisionLocked()
-	}
-}

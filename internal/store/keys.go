@@ -63,10 +63,10 @@ func processFingerprint(p types.ProcessInfo) string {
 	return p.Exe + "|" + strconv.Itoa(p.PID)
 }
 
-func linkKey(l types.NamespaceLinkInfo) string {
-	return recordPrefix(l.NamespaceID) + strconv.Itoa(l.IfIndex)
+func linkKey(i types.InterfaceInfo) string {
+	return recordPrefix(i.NamespaceID) + strconv.Itoa(i.IfIndex)
 }
 
-func linkFingerprint(l types.NamespaceLinkInfo) string {
-	return fmt.Sprintf("%s|%s|%d|%d", l.Name, l.Type, l.RxErrors, l.TxErrors)
+func linkFingerprint(i types.InterfaceInfo) string {
+	return fmt.Sprintf("%s|%s|%d|%d", i.InterfaceName, i.IfType, i.RxErrors, i.TxErrors)
 }

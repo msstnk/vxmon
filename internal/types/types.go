@@ -1,5 +1,9 @@
 package types
 
+import (
+	"time"
+)
+
 // types.go defines shared data models used across store, app, and ui packages.
 type NamespaceInfo struct {
 	ID            uint64
@@ -14,6 +18,18 @@ type NamespaceInfo struct {
 	TCP6InUse     uint64
 	UDP6InUse     uint64
 	PermissionErr string
+}
+
+type linkSample struct {
+	rxBytes uint64
+	txBytes uint64
+}
+
+type LinkSampleRing struct {
+	buffer []linkSample
+	epochs []time.Time
+	pos    int
+	count  int
 }
 
 type InterfaceInfo struct {
@@ -31,11 +47,16 @@ type InterfaceInfo struct {
 	TableID          uint32
 	VxlanID          int
 	VLANID           int
-	ParentID         int
-	MasterID         int
 	ParentName       string
+	ParentIndex      int
 	MasterName       string
+	MasterIndex      int
 	MACAddr          string
+	History          *LinkSampleRing
+	RxBps            uint64
+	TxBps            uint64
+	RxErrors         uint64
+	TxErrors         uint64
 }
 
 type FdbEntry struct {
@@ -97,15 +118,4 @@ type ProcessInfo struct {
 	Exe         string
 	User        string
 	LoadPct     float64
-}
-
-type NamespaceLinkInfo struct {
-	NamespaceID uint64
-	IfIndex     int
-	Name        string
-	Type        string
-	RxBps       uint64
-	TxBps       uint64
-	RxErrors    uint64
-	TxErrors    uint64
 }

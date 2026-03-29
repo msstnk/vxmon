@@ -57,7 +57,7 @@ func (s *Store) reloadProcesses(now time.Time, scan procScanResult) {
 			}
 		}
 		s.inventory.namespaces[i] = info
-		if state := s.inventory.namespacesByID[info.ID]; state != nil {
+		if state := s.inventory.namespaceState[info.ID]; state != nil {
 			state.info = info
 		}
 	}

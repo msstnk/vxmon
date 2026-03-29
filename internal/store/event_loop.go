@@ -173,8 +173,25 @@ func (s *Store) applyFadeTick(at time.Time) eventLoopMsg {
 
 func (s *Store) applyScheduledReload(at time.Time) eventLoopMsg {
 	return s.applyLockedUpdate(at, noupdate, "store.applyScheduledReload sync failed", func() error {
+		prev := make(map[uint64]struct{}, len(s.inventory.namespaceState))
+		for id := range s.inventory.namespaceState {
+			prev[id] = struct{}{}
+		}
 		if err := s.syncNamespaces(); err != nil {
 			return err
+		}
+		newFound := false
+		for id := range s.inventory.namespaceState {
+			if _, existed := prev[id]; !existed {
+				s.collectNamespaceReloadLocked(id, fullReloadMask, at)
+				newFound = true
+			}
+		}
+		if newFound {
+			select {
+			case s.nsResyncCh <- struct{}{}:
+			default:
+			}
 		}
 		s.applyDueNamespaceReloadLocked(at)
 		return nil
@@ -282,7 +299,6 @@ func (s *Store) applyDueNamespaceReloadLocked(now time.Time) {
 			e.refreshedAt = now
 		}
 	}
-	s.rebuildInterfaceIndexes()
 	s.rebuildReferenceMaps()
 }
 

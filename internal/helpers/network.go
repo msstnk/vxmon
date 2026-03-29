@@ -1,13 +1,46 @@
 package helpers
 
 import (
+	"bytes"
 	"fmt"
+	"net"
 	"net/netip"
 	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
 )
+
+func IsBroadcast(hw net.HardwareAddr) bool {
+	if len(hw) != 6 {
+		return false
+	}
+	return bytes.Equal(hw, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+}
+
+// IsMulticast reports whether hw is a multicast MAC (LSB of first byte is 1).
+func IsMulticast(hw net.HardwareAddr) bool {
+	if len(hw) < 1 {
+		return false
+	}
+	return hw[0]&0x01 != 0
+}
+
+func IsUnspecified(hw net.HardwareAddr) bool {
+	if len(hw) == 0 {
+		return true
+	}
+	for _, b := range hw {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func IsBUM(hw net.HardwareAddr) bool {
+	return IsMulticast(hw) || IsBroadcast(hw) || IsUnspecified(hw)
+}
 
 // IsMulticastIP reports whether the input string looks like a multicast IP.
 func IsMulticastIP(s string) bool {
